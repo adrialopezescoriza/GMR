@@ -167,7 +167,7 @@ def slerp(rot1, rot2, t):
     
     return R.from_quat(q)
 
-def get_smplx_data_offline_fast(smplx_data, body_model, smplx_output, tgt_fps=30):
+def get_smplx_data_offline_fast(smplx_data, body_model, smplx_output, tgt_fps=30, object_data=None):
     """
     Must return a dictionary with the following structure:
     {
@@ -184,7 +184,14 @@ def get_smplx_data_offline_fast(smplx_data, body_model, smplx_output, tgt_fps=30
     joints = smplx_output.joints.detach().numpy().squeeze()
     joint_names = JOINT_NAMES[: len(body_model.parents)]
     parents = body_model.parents
-    
+
+    has_object = object_data is not None
+    if has_object:
+        obj_pos = np.asarray(object_data["pos"])            # (T,3)
+        obj_rot = np.asarray(object_data["rot"])            # (T,3) rotvec or (T,4) quat (wxyz)
+        obj_contact = np.asarray(object_data["contact"]).reshape(-1)  # (T,) binary
+        assert obj_pos.shape[0] == num_frames and obj_rot.shape[0] == num_frames and obj_contact.shape[0] == num_frames
+
     if tgt_fps < src_fps:
         # perform fps alignment with proper interpolation
         new_num_frames = num_frames // frame_skip
@@ -231,11 +238,47 @@ def get_smplx_data_offline_fast(smplx_data, body_model, smplx_output, tgt_fps=30
                 interp_func = interp1d(original_time, joints[:, i, j], kind='linear')
                 joints_interp.append(interp_func(target_time))
         joints = np.stack(joints_interp, axis=1).reshape(new_num_frames, -1, 3)
-        
+
+        # --- Interpolate object (if provided) ---
+        if has_object:
+            # positions: linear
+            obj_pos_interp = []
+            for j in range(3):
+                interp_func = interp1d(original_time, obj_pos[:, j], kind='linear')
+                obj_pos_interp.append(interp_func(target_time))
+            obj_pos = np.stack(obj_pos_interp, axis=1)  # (new_T,3)
+
+            # rotations: SLERP between neighbors
+            obj_rot_interp_quat = []
+            is_quat = (obj_rot.shape[-1] == 4)
+            if is_quat:
+                def to_R(k): return R.from_quat(obj_rot[k], scalar_first=True)
+            else:
+                def to_R(k): return R.from_rotvec(obj_rot[k])
+            for t in target_time:
+                idx1 = int(np.floor(t))
+                idx2 = min(idx1 + 1, num_frames - 1)
+                alpha = t - idx1
+                rot1 = to_R(idx1)
+                rot2 = to_R(idx2)
+                interp_rot = slerp(rot1, rot2, alpha)
+                obj_rot_interp_quat.append(interp_rot.as_quat(scalar_first=True))
+            obj_rot = np.stack(obj_rot_interp_quat, axis=0)  # (new_T,4)
+
+            # contact: nearest-neighbor (keeps binary)
+            contact_interp_func = interp1d(original_time, obj_contact.astype(float), kind='nearest')
+            obj_contact = contact_interp_func(target_time).astype(np.int32).reshape(-1, 1)  # (new_T,1)
+
         aligned_fps = len(global_orient) / num_frames * src_fps
     else:
         aligned_fps = tgt_fps
-        
+        # Keep original object data if any (no resampling)
+        if has_object:
+            if obj_rot.shape[-1] == 3:
+                # keep orientation as quaternion for output consistency
+                obj_rot = R.from_rotvec(obj_rot).as_quat(scalar_first=True)
+            obj_contact = obj_contact.astype(np.int32).reshape(-1, 1)  # ensure int
+
     smplx_data_frames = []
     for curr_frame in range(len(global_orient)):
         result = {}
@@ -252,11 +295,20 @@ def get_smplx_data_offline_fast(smplx_data, body_model, smplx_output, tgt_fps=30
                 )
             joint_orientations.append(rot)
             result[joint_name] = (single_joints[i], rot.as_quat(scalar_first=True))
-
-
         smplx_data_frames.append(result)
 
-    return smplx_data_frames, aligned_fps
+    # --- Build object frames aligned with SMPL frames (optional) ---
+    object_frames = None
+    if has_object:
+        # Ensure lengths match (in case of rounding)
+        T = len(smplx_data_frames)
+        if obj_pos.shape[0] != T:
+            obj_pos = obj_pos[:T]
+            obj_rot = obj_rot[:T]
+            obj_contact = obj_contact[:T]  # NEW
+        object_frames = [(obj_pos[k], obj_rot[k], obj_contact[k]) for k in range(T)]  # NEW
+
+    return smplx_data_frames, aligned_fps, object_frames
 
 
 

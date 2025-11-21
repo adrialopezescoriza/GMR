@@ -9,6 +9,35 @@ from loop_rate_limiters import RateLimiter
 import numpy as np
 from rich import print
 
+def _object_geom_params(object, data):
+    """Return (gtype, size, pos, mat, rgba) for the kinematic object."""
+    if data is None:
+        return None
+    pos, quat_wxyz, contact = data
+
+    if object == "ball":
+        gtype = mj.mjtGeom.mjGEOM_SPHERE
+        size  = np.array([0.1, 0.0, 0.0])        # sphere radius in size[0]
+    else:
+        gtype = mj.mjtGeom.mjGEOM_BOX
+        size  = np.array([0.12, 0.12, 0.12])      # half-sizes
+    
+    rgba = np.array([0.9, 0.2, 0.2, 1.0]) if contact else np.array([0.2, 0.9, 0.2, 0.5])
+
+    # SciPy expects (x, y, z, w); user passes scalar-first (w, x, y, z)
+    mat = R.from_quat(quat_wxyz, scalar_first=True).as_matrix().reshape(-1)
+    return gtype, size, pos, mat, rgba
+
+def draw_object(viewer, object, data):
+    """Draw a single primitive at the desired pose in the on-screen viewer."""
+    params = _object_geom_params(object, data)
+    if params is None:
+        return
+    gtype, size, pos, mat, rgba = params
+    geom = viewer.user_scn.geoms[viewer.user_scn.ngeom]
+    mj.mjv_initGeom(geom, type=gtype, size=size, pos=pos, mat=mat, rgba=rgba)
+    viewer.user_scn.ngeom += 1
+
 
 def draw_frame(
     pos,
@@ -103,6 +132,7 @@ class RobotMotionViewer:
             human_point_scale=0.1,
             # human pos offset add for visualization    
             human_pos_offset=np.array([0.0, 0.0, 0]),
+            object_data=None,
             # rate limit
             rate_limit=True, 
             follow_camera=True,
@@ -132,16 +162,18 @@ class RobotMotionViewer:
         if human_motion_data is not None:
             # Clean custom geometry
             self.viewer.user_scn.ngeom = 0
-            # Draw the task targets for reference
-            for human_body_name, (pos, rot) in human_motion_data.items():
-                draw_frame(
-                    pos,
-                    R.from_quat(rot, scalar_first=True).as_matrix(),
-                    self.viewer,
-                    human_point_scale,
-                    pos_offset=human_pos_offset,
-                    joint_name=human_body_name if show_human_body_name else None
-                    )
+        if object_data is not None:
+            draw_object(self.viewer, "ball", object_data)
+        # Draw the task targets for reference
+        for human_body_name, (pos, rot) in human_motion_data.items():
+            draw_frame(
+                pos,
+                R.from_quat(rot, scalar_first=True).as_matrix(),
+                self.viewer,
+                human_point_scale,
+                pos_offset=human_pos_offset,
+                joint_name=human_body_name if show_human_body_name else None
+            )
 
         self.viewer.sync()
         if rate_limit is True:
@@ -150,6 +182,17 @@ class RobotMotionViewer:
         if self.record_video:
             # Use renderer for proper offscreen rendering
             self.renderer.update_scene(self.data, camera=self.viewer.cam)
+
+            # Also draw the kinematic object into the renderer's scene (so it shows in video)
+            if object_data is not None:
+                params = _object_geom_params("ball", object_data)
+                if params is not None:
+                    gtype, size, pos, mat, rgba = params
+                    rscene = self.renderer.scene
+                    rgeom = rscene.geoms[rscene.ngeom]
+                    mj.mjv_initGeom(rgeom, type=gtype, size=size, pos=pos, mat=mat, rgba=rgba)
+                    rscene.ngeom += 1
+
             img = self.renderer.render()
             self.mp4_writer.append_data(img)
     
