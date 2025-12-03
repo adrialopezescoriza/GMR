@@ -17,7 +17,7 @@ def _object_geom_params(object, data):
 
     if object == "ball":
         gtype = mj.mjtGeom.mjGEOM_SPHERE
-        size  = np.array([0.1, 0.0, 0.0])        # sphere radius in size[0]
+        size  = np.array([0.12, 0.0, 0.0])        # sphere radius in size[0]
     else:
         gtype = mj.mjtGeom.mjGEOM_BOX
         size  = np.array([0.12, 0.12, 0.12])      # half-sizes

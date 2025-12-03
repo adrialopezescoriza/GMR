@@ -144,14 +144,12 @@ def build_and_solve_ball_optimization(
 
         if ground_contact_flags[k]:
             # GROUND contact:
-            #   p_z >= 0.1, p_z <= 0.14
-            #   v_z >= -0.05, v_z <= 0.05
             p_z = p_k[2]
             v_z = v_k[2]
-            ineq_constraints.append(p_z - 0.14)   # p_z <= 0.14
-            ineq_constraints.append(-p_z + 0.10)  # p_z >= 0.10
-            ineq_constraints.append(v_z - 0.05)    # v_z <= 0.05
-            ineq_constraints.append(-v_z - 0.05)   # v_z >= -0.05
+            ineq_constraints.append(p_z - 0.13)
+            ineq_constraints.append(-p_z + 0.11)
+            ineq_constraints.append(v_z - 0.05)
+            ineq_constraints.append(-v_z - 0.05)
 
     # ---------------- stack constraints & solve ---------------- #
 

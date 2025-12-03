@@ -1,13 +1,14 @@
 import os
 import argparse
 import pathlib
+from threading import local
 import time
 import numpy as np
 from sympy import im
 from tqdm import tqdm
 import torch
 import smplx
-
+from general_motion_retargeting import torch_utils 
 import numpy as np
 
 from general_motion_retargeting import GeneralMotionRetargeting as GMR
@@ -22,6 +23,14 @@ SKILLMIMIC_INDEX_MAP = torch.tensor([0, 1, 5, 10, 2, 6, 11, 3, 7, 12, 4, 8, 13, 
                                         44, 45, 46, 47, 48, 49, 50, 51, 52])
 
 MIN_BALL_HEIGHT = 0.13  # Minimum height to consider ball in contact with ground
+CONTACT_LINK_NAME = {
+    "unitree_g1": "right_rubber_hand",
+    "unitree_h1_2_with_hands": "right_hand_link",
+}
+LOCAL_LINK_OFSET_DICT = {
+    "unitree_g1": np.array([0.08, 0.12, 0.03]),
+    "unitree_h1_2_with_hands": np.array([0.08, 0.12, 0.03]),
+}
 
 def load_smplx_data(smplx_data, smplx_body_model_path):
     body_model = smplx.create(
@@ -174,9 +183,20 @@ def convert_smplx_to_robot(smplx_data, args):
         root_rot=torch.from_numpy(root_rot)[...,[1,2,3,0]].to(device="cuda:0", dtype=torch.float32), 
         dof_pos=torch.from_numpy(dof_pos).to(device="cuda:0", dtype=torch.float32)
     )
+
+    local_body_pos, local_body_orient = kinematics_model.forward_kinematics(
+        root_pos=torch.zeros(root_pos.shape).to(device="cuda:0", dtype=torch.float32),
+        root_rot=torch.zeros(root_rot.shape).to(device="cuda:0", dtype=torch.float32) + torch.tensor([0.0, 0.0, 0.0, 1.0]).to(device="cuda:0", dtype=torch.float32),  # identity quat
+        dof_pos=torch.from_numpy(dof_pos).to(device="cuda:0", dtype=torch.float32)
+    )
+
+
     body_names = kinematics_model.body_names
     world_body_orient = world_body_orient[..., [3,0,1,2]].cpu().numpy()  # to quat scalar first
     world_body_pos = world_body_pos.cpu().numpy()
+
+    local_body_orient = local_body_orient[..., [3,0,1,2]].cpu().numpy()  # to quat scalar first
+    local_body_pos = local_body_pos.cpu().numpy()
     
     motion_data = {
         "fps": aligned_fps, # motion frequency
@@ -185,6 +205,8 @@ def convert_smplx_to_robot(smplx_data, args):
         "dof_pos": dof_pos, # robot joint angles (rad) (N, num_dof)
         "world_body_pos": world_body_pos, # local body positions (N, num_bodies, 3)
         "world_body_orient": world_body_orient, # local body orientations (quaternion) (N, num_bodies, 4)
+        "local_body_pos": local_body_pos, # local body positions (N, num_bodies, 3)
+        "local_body_orient": local_body_orient, # local body orientations
         "link_body_list": body_names, # body names corresponding to local_body_pos
         "dof_names": retarget.robot_motor_names, # robot joint names in order
     }
@@ -202,8 +224,8 @@ def convert_smplx_to_robot(smplx_data, args):
         if args.retarget_dynamic_object:
             optimized_obj_pos, optimized_obj_vel = optimize_object_traj_from_motion(
                 motion_data=motion_data,
-                contact_link_name="right_rubber_hand",
-                local_offset=np.array([0.04, 0.085, 0.03]),
+                contact_link_name=CONTACT_LINK_NAME.get(args.robot, "right_rubber_hand"),
+                local_offset=np.array(LOCAL_LINK_OFSET_DICT.get(args.robot, np.array([0.0, 0.0, 0.0]))),
                 speed_thresh=0.05,
             )
             motion_data["object_pos"] = optimized_obj_pos
