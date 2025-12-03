@@ -51,6 +51,14 @@ assets/body_models/
 *.flv
 *.webm
 
+# 3D model files
+*.obj
+*.fbx
+*.dae
+*.stl
+*.ply
+*.mtl
+
 # Archives
 *.zip
 *.tar

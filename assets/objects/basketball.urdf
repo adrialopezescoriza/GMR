@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<robot name="ball_12cm">
+
+  <!-- Single spherical rigid body -->
+  <link name="ball_link">
+
+    <!-- Inertial properties (reasonable defaults) -->
+    <inertial>
+      <origin xyz="0 0 0"/>
+      <mass value="1.0"/>
+      <!-- inertia of a solid sphere: I = 2/5 * m * r^2 -->
+      <inertia ixx="0.00576" ixy="0" ixz="0"
+               iyy="0.00576" iyz="0"
+               izz="0.00576"/>
+    </inertial>
+
+    <!-- Collision geometry -->
+    <collision>
+      <origin xyz="0 0 0"/>
+      <geometry>
+        <sphere radius="0.12"/>
+      </geometry>
+    </collision>
+
+    <!-- Visual geometry -->
+    <visual>
+      <origin xyz="0 0 0"/>
+      <geometry>
+        <sphere radius="0.12"/>
+      </geometry>
+      <material name="ball_color">
+        <color rgba="1 0.5 0 1"/> <!-- orange ball -->
+      </material>
+    </visual>
+
+  </link>
+
+</robot>
