@@ -9,19 +9,10 @@ from pinocchio.visualize import MeshcatVisualizer
 import meshcat.geometry as g
 import meshcat.transformations as tf
 import os
-import glob
 import pickle
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
-
-import torch
-
-# -------------------------------------------------------------------
-# Hardcoded configuration (same as your Drake script)
-# -------------------------------------------------------------------
-
 URDF_PATH = "assets/unitree_g1/g1_29dof_w_hands.urdf"
-OBJECT_URDF_PATH = "assets/objects/basketball.urdf"   # not strictly needed here
+OBJECT_URDF_PATH = "assets/objects/basketball.urdf"
 BASE_JOINT_NAME = "pelvis"
 BASE_BODY_NAME = "pelvis"
 OBJECT_BODY_NAME = "ball_link"
@@ -53,13 +44,13 @@ STATIONARY_BODIES = ["left_ankle_roll_link", "right_ankle_roll_link"]
 STATIONARY_SPEED_THRESH = 0.02  # [m/s] tune (e.g., 0.02–0.10)
 
 JOINT_TRACKING_WEIGHTS = {
-    # # 'left_hip_pitch_joint': 5.0, 
+    # # 'left_hip_pitch_joint': 1.0, 
     # # 'left_hip_roll_joint': 1.0, 
     # 'left_hip_yaw_joint': 1.0, 
     # 'left_knee_joint': 1.0, 
-    # 'left_ankle_pitch_joint': 5.0, 
+    # 'left_ankle_pitch_joint': 1.0, 
     # 'left_ankle_roll_joint': 1.0, 
-    # # 'right_hip_pitch_joint': 5.0, 
+    # # 'right_hip_pitch_joint': 1.0, 
     # # 'right_hip_roll_joint': 1.0, 
     # 'right_hip_yaw_joint': 1.0, 
     # 'right_knee_joint': 1.0, 
@@ -107,7 +98,8 @@ HAND_COLLISION_BOX = {
 
 POSE_TRACKING_WEIGHT = 1.0
 LINK_POS_TRACKING_WEIGHT = 1.0
-LINK_ORIENT_TRACKING_WEIGHT = 1.0
+LINK_B_ORIENT_TRACKING_WEIGHT = 1.0
+LINK_W_ORIENT_TRACKING_WEIGHT = 1.0
 CONTACT_POS_COST_WEIGHT = 50.0
 
 KINEMATIC_CONSISTENCY_WEIGHT = 1.0
@@ -421,28 +413,6 @@ class PinocchioContactProjector:
         dof_idx_map = self.robot.dof_name_to_index
         dof_col_index = {name: i for i, name in enumerate(dof_names)}
 
-
-        # --- Precompute reference world body speeds (finite diff) ---
-        n_bodies = len(body_names)
-        ref_speed_sq = np.zeros((N, n_bodies), dtype=np.float64)
-
-        for t in range(1, N):
-            dp = ref_world_body_pos[t] - ref_world_body_pos[t - 1]          # (n_bodies, 3)
-            v  = dp / dt                                                   # (n_bodies, 3)
-            ref_speed_sq[t] = np.sum(v * v, axis=1)
-
-        ref_speed_sq[0] = ref_speed_sq[1] if N > 1 else 0.0
-
-        stationary_thresh_sq = float(STATIONARY_SPEED_THRESH ** 2)
-
-        # bodies we actually can constrain (exist in both lists and have FK)
-        stationary_body_indices = []
-        for b in STATIONARY_BODIES:
-            if (b in body_names) and (b in self.robot.fk_world_pos):
-                stationary_body_indices.append((b, body_names.index(b)))
-
-        mask_stationary = ref_speed_sq <= stationary_thresh_sq  # (N, n_bodies)
-
         # --- Precompute reference rotation matrices from quaternions (numeric) ---
 
         # Base (root) world rotation reference
@@ -469,16 +439,11 @@ class PinocchioContactProjector:
 
         total_cost = 0
 
-        # # A. Velocity smoothness
-        # for t in range(N - 1):
-        #     dv = v_traj[t+1, :] - v_traj[t, :]
-        #     total_cost += VELOCITY_REG_WEIGHT * ca.sumsqr(dv)
-
         # Base indices in Pinocchio: [x,y,z,qx,qy,qz,qw]
         base_pos_idx  = self.robot.base_q_start
         base_quat_idx = self.robot.base_q_start + 3
 
-        # B. Per-frame costs and constraints
+        ################ Per-frame constraints and costs ################
         for t in range(N):
             q_t = q_traj[t, :].T  # (nq,1) MX
 
@@ -575,15 +540,11 @@ class PinocchioContactProjector:
                     total_cost += w * LINK_POS_TRACKING_WEIGHT * ca.sumsqr(p_WB - p_WB_ref)
 
                     R_WB = self.robot.world_rotmat(link_name, q_t)
-
-                    # total_cost += w * LINK_ORIENT_TRACKING_WEIGHT * 1e-4 * so3_angle_cost(
-                    #     ca.DM(R_world_ref[t, idx]), R_WB
-                    # )
-                    total_cost += w * LINK_ORIENT_TRACKING_WEIGHT * ca.sumsqr(
+                    total_cost += w * LINK_W_ORIENT_TRACKING_WEIGHT * ca.sumsqr(
                         R_WB - ca.DM(R_world_ref[t, idx])
                     )
 
-            # --- Local (base-relative) link tracking ---
+            # --- Local (base-relative) link tracking (only orient) ---
             for link_name, w in LINK_TRACKING_WEIGHTS_B.items():
                 key = (self.base_body_name, link_name)
                 if link_name in body_names and key in self.robot.fk_rel_pos:
@@ -594,10 +555,7 @@ class PinocchioContactProjector:
                     # total_cost += w * LINK_POS_TRACKING_WEIGHT * ca.sumsqr(p_BB - p_BB_ref)
 
                     R_BB = self.robot.rel_rotmat(self.base_body_name, link_name, q_t)
-                    # total_cost += w * LINK_ORIENT_TRACKING_WEIGHT * 1e-4 * so3_angle_cost(
-                    #     ca.DM(R_local_ref[t, idx]), R_BB
-                    # )
-                    total_cost += w * LINK_ORIENT_TRACKING_WEIGHT * ca.sumsqr(
+                    total_cost += w * LINK_B_ORIENT_TRACKING_WEIGHT * ca.sumsqr(
                         R_BB - ca.DM(R_local_ref[t, idx])
                     )
 
@@ -651,18 +609,6 @@ class PinocchioContactProjector:
 
                     # Hard inequality on squared distance
                     opti.subject_to(dist_box_sq >= (BALL_RADIUS+0.01)**2)
-
-            # --- World-velocity stationary constraint for selected bodies ---
-            q_prev = q_traj[t - 1, :].T  # (nq,1) MX
-
-            for b_name, b_idx in stationary_body_indices:
-                if mask_stationary[t, b_idx]:
-                    p_curr = self.robot.world_pos(b_name, q_t)     # 3x1 MX
-                    p_prev = self.robot.world_pos(b_name, q_prev)  # 3x1 MX
-                    v_w = (p_curr - p_prev) / dt                   # 3x1 MX
-
-                    # Enforce speed <= threshold  (use squared norm to avoid sqrt)
-                    # opti.subject_to(ca.sumsqr(v_w) <= STATIONARY_SPEED_THRESH**2)
 
                     
 
