@@ -14,6 +14,8 @@ import pickle
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+import torch
+
 # -------------------------------------------------------------------
 # Hardcoded configuration (same as your Drake script)
 # -------------------------------------------------------------------
@@ -26,7 +28,7 @@ OBJECT_BODY_NAME = "ball_link"
 
 LINK_TRACKING_WEIGHTS_W = {
     "head_link": 1.0,
-    # "torso_link": 0.0,
+    # "pelvis": 1.0,
     "left_ankle_roll_link": 100.0,
     "right_ankle_roll_link": 100.0,
     # "left_ankle_pitch_link": 10.0,
@@ -39,25 +41,28 @@ LINK_TRACKING_WEIGHTS_B = {
     "torso_link": 1.0,
     "left_rubber_hand": 1.0,
     "right_rubber_hand": 1.0,
-    # "right_wrist_yaw_link": 1.0,
-    # "left_wrist_yaw_link": 1.0,
+    "right_wrist_yaw_link": 1.0,
+    "left_wrist_yaw_link": 1.0,
     "right_elbow_link": 1.0,
     "left_elbow_link": 1.0,
     "right_shoulder_yaw_link": 1.0,
     "left_shoulder_yaw_link": 1.0,
 }
 
+STATIONARY_BODIES = ["left_ankle_roll_link", "right_ankle_roll_link"]
+STATIONARY_SPEED_THRESH = 0.02  # [m/s] tune (e.g., 0.02–0.10)
+
 JOINT_TRACKING_WEIGHTS = {
     # # 'left_hip_pitch_joint': 5.0, 
     # # 'left_hip_roll_joint': 1.0, 
     # 'left_hip_yaw_joint': 1.0, 
-    # # 'left_knee_joint': 1.0, 
+    # 'left_knee_joint': 1.0, 
     # 'left_ankle_pitch_joint': 5.0, 
     # 'left_ankle_roll_joint': 1.0, 
     # # 'right_hip_pitch_joint': 5.0, 
     # # 'right_hip_roll_joint': 1.0, 
     # 'right_hip_yaw_joint': 1.0, 
-    # # 'right_knee_joint': 1.0, 
+    # 'right_knee_joint': 1.0, 
     # 'right_ankle_pitch_joint': 1.0, 
     # 'right_ankle_roll_joint': 1.0, 
     # 'waist_yaw_joint': 1.0, 
@@ -80,9 +85,25 @@ JOINT_TRACKING_WEIGHTS = {
 }
 
 CONTACT_POINTS_O_LOCAL = {
-    "left_rubber_hand":  np.array([0.03, -0.11, 0.01]),
-    "right_rubber_hand": np.array([0.03, 0.11, 0.01]),
+    "left_rubber_hand":  np.array([0.07, -0.11, 0.05]),
+    "right_rubber_hand": np.array([0.07, 0.11, 0.05]),
 } # object center position in hand frame
+
+BALL_RADIUS = 0.12
+
+# Axis-aligned boxes in each hand's *local frame*:
+# center: box center in hand frame
+# half_size: half-length along each axis [hx, hy, hz]
+HAND_COLLISION_BOX = {
+    "left_rubber_hand": {
+        "center":    np.array([0.07, 0.08, 0.0]),   # tune as needed
+        "half_size": np.array([0.15,  0.16, 0.15]),  # box extends ± these
+    },
+    "right_rubber_hand": {
+        "center":    np.array([0.07, -0.08, 0.0]),
+        "half_size": np.array([0.15, 0.16, 0.15]),
+    },
+}
 
 POSE_TRACKING_WEIGHT = 1.0
 LINK_POS_TRACKING_WEIGHT = 1.0
@@ -90,7 +111,7 @@ LINK_ORIENT_TRACKING_WEIGHT = 1.0
 CONTACT_POS_COST_WEIGHT = 50.0
 
 KINEMATIC_CONSISTENCY_WEIGHT = 1.0
-VELOCITY_REG_WEIGHT = 0.01
+VELOCITY_REG_WEIGHT = 5e-4
 
 
 # -------------------------------------------------------------------
@@ -245,6 +266,27 @@ class PinocchioCasadiRobot:
         self.nq = self.model.nq
         self.nv = self.model.nv
 
+        # ----------------------------
+        # Joint limits from URDF / Pinocchio model
+        # ----------------------------
+        self.q_lower = self.model.lowerPositionLimit.copy()
+        self.q_upper = self.model.upperPositionLimit.copy()
+        self.v_abs   = self.model.velocityLimit.copy()   # absolute (symmetric): |v| <= v_abs
+
+        # Indices in q / v corresponding to *1-DoF joints only* (matches dof_name_to_index)
+        self.joint_q_indices = []
+        self.joint_v_indices = []
+
+        for jid, joint in enumerate(self.model.joints):
+            if jid <= 1:  # universe + freeflyer
+                continue
+            if joint.nq == 1 and joint.nv == 1:
+                self.joint_q_indices.append(joint.idx_q)
+                self.joint_v_indices.append(joint.idx_v)
+
+        self.joint_q_indices = np.array(self.joint_q_indices, dtype=int)
+        self.joint_v_indices = np.array(self.joint_v_indices, dtype=int)
+
         # Free-flyer joint is usually joint 1
         ff_joint = self.model.joints[1]
         self.base_q_start = ff_joint.idx_q   # typically 0
@@ -323,7 +365,7 @@ class PinocchioCasadiRobot:
         # Add a ball to Meshcat viewer
         self.ball_path = "ball"
         self.viz.viewer[self.ball_path].set_object(
-            g.Sphere(0.12), g.MeshLambertMaterial(color=0xFF8000)
+            g.Sphere(BALL_RADIUS), g.MeshLambertMaterial(color=0xFF8000)
         )
 
     # Simple wrappers
@@ -379,6 +421,28 @@ class PinocchioContactProjector:
         dof_idx_map = self.robot.dof_name_to_index
         dof_col_index = {name: i for i, name in enumerate(dof_names)}
 
+
+        # --- Precompute reference world body speeds (finite diff) ---
+        n_bodies = len(body_names)
+        ref_speed_sq = np.zeros((N, n_bodies), dtype=np.float64)
+
+        for t in range(1, N):
+            dp = ref_world_body_pos[t] - ref_world_body_pos[t - 1]          # (n_bodies, 3)
+            v  = dp / dt                                                   # (n_bodies, 3)
+            ref_speed_sq[t] = np.sum(v * v, axis=1)
+
+        ref_speed_sq[0] = ref_speed_sq[1] if N > 1 else 0.0
+
+        stationary_thresh_sq = float(STATIONARY_SPEED_THRESH ** 2)
+
+        # bodies we actually can constrain (exist in both lists and have FK)
+        stationary_body_indices = []
+        for b in STATIONARY_BODIES:
+            if (b in body_names) and (b in self.robot.fk_world_pos):
+                stationary_body_indices.append((b, body_names.index(b)))
+
+        mask_stationary = ref_speed_sq <= stationary_thresh_sq  # (N, n_bodies)
+
         # --- Precompute reference rotation matrices from quaternions (numeric) ---
 
         # Base (root) world rotation reference
@@ -405,10 +469,10 @@ class PinocchioContactProjector:
 
         total_cost = 0
 
-        # A. Velocity smoothness
-        for t in range(N - 1):
-            dv = v_traj[t+1, :] - v_traj[t, :]
-            total_cost += VELOCITY_REG_WEIGHT * ca.sumsqr(dv)
+        # # A. Velocity smoothness
+        # for t in range(N - 1):
+        #     dv = v_traj[t+1, :] - v_traj[t, :]
+        #     total_cost += VELOCITY_REG_WEIGHT * ca.sumsqr(dv)
 
         # Base indices in Pinocchio: [x,y,z,qx,qy,qz,qw]
         base_pos_idx  = self.robot.base_q_start
@@ -423,7 +487,26 @@ class PinocchioContactProjector:
             q_joints   = q_t[7:]
             v_joints   = v_traj[t, 6:].T
 
-            # Kinematic consistency cost (FK vs finite diff velocities)
+            # Joint position + velocity limits from URDF
+            for idx_q, idx_v in zip(self.robot.joint_q_indices, self.robot.joint_v_indices):
+                # Position limits
+                q_lo = float(self.robot.q_lower[idx_q])
+                q_hi = float(self.robot.q_upper[idx_q])
+
+                # Some URDF joints may be "continuous" and show +/- inf.
+                # Skip if not finite.
+                if np.isfinite(q_lo) and np.isfinite(q_hi):
+                    opti.subject_to(q_t[idx_q] >= q_lo)
+                    opti.subject_to(q_t[idx_q] <= q_hi)
+
+                # Velocity limits (absolute bound)
+                v_lim = float(self.robot.v_abs[idx_v])
+                if np.isfinite(v_lim) and v_lim > 0:
+                    opti.subject_to(v_traj[t, idx_v] >= -v_lim)
+                    opti.subject_to(v_traj[t, idx_v] <=  v_lim)
+
+
+            # Kinematic consistency constraint (FK vs finite diff velocities)
             if t > 0:
                 q_prev_joints = q_traj[t-1, 7:].T
                 v_fd = (q_joints - q_prev_joints) / dt
@@ -432,18 +515,44 @@ class PinocchioContactProjector:
                 q_prev_base_pos = q_traj[t-1, base_pos_idx : base_pos_idx+3].T
                 v_fd_base = (q_base_pos - q_prev_base_pos) / dt
                 v_joints_base = v_traj[t, 0:3].T
-                total_cost += KINEMATIC_CONSISTENCY_WEIGHT * ca.sumsqr(v_fd_base - v_joints_base)
 
+                # Constraint (with numerical stability in mind)
+                opti.subject_to(v_fd_base == v_joints_base)
+                # Cost
+                #total_cost += KINEMATIC_CONSISTENCY_WEIGHT * ca.sumsqr(v_fd_base - v_joints_base)
+
+                # Constraint on base orientation via quaternions
+                q_prev_base_quat = q_traj[t-1, base_quat_idx : base_quat_idx+4].T
+                q_conj = quat_conjugate_wxyz(q_prev_base_quat)
+                q_rel = quat_mul_wxyz(q_conj, q_base_quat)  # relative rotation
+                axis_angle = axis_angle_from_quat_wxyz(q_rel)
+                v_fd_base_orient = axis_angle / dt
+                v_joints_base_orient = v_traj[t, 3:6].T
+                opti.subject_to(v_fd_base_orient == v_joints_base_orient)
+
+                
             # --- Base position constraint (tight bounding box) ---
-            for i in range(3):
-                opti.subject_to(q_base_pos[i] >= root_pos[t, i] - 0.5)
-                opti.subject_to(q_base_pos[i] <= root_pos[t, i] + 0.5)
+            # for i in range(3):
+            #     opti.subject_to(q_base_pos[i] >= root_pos[t, i] - 0.5)
+            #     opti.subject_to(q_base_pos[i] <= root_pos[t, i] + 0.5)
 
             # --- Base orientation cost ---
             R_WB = self.robot.world_rotmat(self.base_body_name, q_t)
             total_cost += POSE_TRACKING_WEIGHT * 1e-4 * ca.sumsqr(
                 R_WB - ca.DM(R_base_ref[t])
             )
+
+            # --- Penalize heavy acceleration changes ---
+            if t > 1:
+                v_prev = v_traj[t-1, :].T
+                v_curr = v_traj[t, :].T
+                a_prev = (v_curr - v_prev) / dt
+
+                v_prev2 = v_traj[t-2, :].T
+                a_prev2 = (v_prev - v_prev2) / dt
+
+                da = a_prev - a_prev2
+                total_cost += VELOCITY_REG_WEIGHT * ca.sumsqr(da)
 
             # --- Joint position tracking (only for selected joints) ---
             for j_name, w in JOINT_TRACKING_WEIGHTS.items():
@@ -495,7 +604,7 @@ class PinocchioContactProjector:
             # --- Contact tracking (hands to ball) ---
             for name in CONTACT_POINTS_O_LOCAL.keys():
                 # Only active when contact_seq says "in contact" and we have an offset
-                if contact_seq[t] <= 0.5 or name not in CONTACT_POINTS_O_LOCAL:
+                if name not in CONTACT_POINTS_O_LOCAL:
                     continue
                 if name not in self.robot.fk_world_pos:
                     continue
@@ -514,8 +623,48 @@ class PinocchioContactProjector:
                 # Desired object center from the reference data
                 p_WC_des = ca.DM(obj_pos[t].reshape(3, 1))    # 3x1 DM
 
-                # Penalize deviation
-                total_cost += CONTACT_POS_COST_WEIGHT * ca.sumsqr(p_WC_pred - p_WC_des)
+                # Contact position cost
+                if contact_seq[t] > 0.5:
+                    total_cost += CONTACT_POS_COST_WEIGHT * ca.sumsqr(p_WC_pred - p_WC_des)
+                elif not np.any(contact_seq[t:t+3] > 0.5):
+                    box_def = HAND_COLLISION_BOX.get(name, None)
+                    if box_def is None:
+                        # no box specified for this hand → skip
+                        continue
+
+                    center_B = ca.DM(box_def["center"].reshape(3, 1))      # 3x1
+                    half_B   = ca.DM(box_def["half_size"].reshape(3, 1))   # 3x1
+
+                    # Ball center in hand frame
+                    delta_W = p_WC_des - p_WB               # 3x1 MX
+                    p_B = R_WB.T @ delta_W                  # 3x1 MX
+
+                    # Distance from point p_B to axis-aligned box in hand frame
+                    # centered at 'center_B' with half-sizes 'half_B':
+                    #   d = || max(0, |p_B - center_B| - half_B) ||
+                    diff_local  = p_B - center_B           # 3x1
+                    abs_diff = ca.fabs(diff_local)      # 3x1
+                    zero_vec = ca.DM.zeros(3, 1)
+                    excess = ca.fmax(zero_vec, abs_diff - half_B)  # 3x1 MX
+
+                    dist_box_sq = ca.sumsqr(excess)          # scalar MX ≥ 0
+
+                    # Hard inequality on squared distance
+                    opti.subject_to(dist_box_sq >= (BALL_RADIUS+0.01)**2)
+
+            # --- World-velocity stationary constraint for selected bodies ---
+            q_prev = q_traj[t - 1, :].T  # (nq,1) MX
+
+            for b_name, b_idx in stationary_body_indices:
+                if mask_stationary[t, b_idx]:
+                    p_curr = self.robot.world_pos(b_name, q_t)     # 3x1 MX
+                    p_prev = self.robot.world_pos(b_name, q_prev)  # 3x1 MX
+                    v_w = (p_curr - p_prev) / dt                   # 3x1 MX
+
+                    # Enforce speed <= threshold  (use squared norm to avoid sqrt)
+                    # opti.subject_to(ca.sumsqr(v_w) <= STATIONARY_SPEED_THRESH**2)
+
+                    
 
         # Set objective
         opti.minimize(total_cost)
@@ -537,11 +686,20 @@ class PinocchioContactProjector:
             for i, j_name in enumerate(dof_names):
                 if j_name in dof_idx_map:
                     idx_q = dof_idx_map[j_name]
-                    q_init[t, idx_q] = dof_pos[t, i]
+                    q_init[t, idx_q] = np.clip(dof_pos[t, i], self.robot.q_lower[idx_q], self.robot.q_upper[idx_q])
 
         # velocities via finite diff (joints only)
         for t in range(1, N):
-            v_init[t, 6:] = (q_init[t, 7:] - q_init[t-1, 7:]) / dt
+            v_init[t, :3] = np.clip((q_init[t, :3] - q_init[t-1, :3]) / dt, -self.robot.v_abs[:3], self.robot.v_abs[:3])
+            # Orientation velocities (base)
+            q_prev_quat = q_init[t-1, 3:7]
+            q_curr_quat = q_init[t, 3:7]
+            q_conj = quat_conjugate_wxyz(ca.DM(q_prev_quat.reshape(4,1)))
+            q_rel = quat_mul_wxyz(q_conj, ca.DM(q_curr_quat.reshape(4,1)))
+            axis_angle = axis_angle_from_quat_wxyz(q_rel)
+            v_init[t, 3:6] = np.clip((axis_angle / dt).full().flatten(), -self.robot.v_abs[3:6], self.robot.v_abs[3:6])
+            # Joint velocities
+            v_init[t, 6:] = np.clip((q_init[t, 7:] - q_init[t-1, 7:]) / dt, -self.robot.v_abs[6:], self.robot.v_abs[6:])
         v_init[0, :] = v_init[1, :]
 
         opti.set_initial(q_traj, q_init)
@@ -553,7 +711,12 @@ class PinocchioContactProjector:
 
         print(f"[INFO] Solving global optimization (Vars: {N*(nq+nv)})...")
         t0 = time.time()
-        sol = opti.solve()
+        try:
+            sol = opti.solve()
+        except RuntimeError as e:
+            print(f"[ERROR] Solver failed: {e}")
+            print("[INFO] Returning original motion data.")
+            return motion_data
         t1 = time.time()
         print("[INFO] Solver finished.")
         print(f"[INFO] Solver time: {t1 - t0:.2f} s")
