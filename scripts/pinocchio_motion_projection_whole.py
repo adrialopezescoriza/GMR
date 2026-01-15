@@ -584,31 +584,31 @@ class PinocchioContactProjector:
                 # Contact position cost
                 if contact_seq[t] > 0.5:
                     total_cost += CONTACT_POS_COST_WEIGHT * ca.sumsqr(p_WC_pred - p_WC_des)
-                elif not np.any(contact_seq[t:t+3] > 0.5):
-                    box_def = HAND_COLLISION_BOX.get(name, None)
-                    if box_def is None:
-                        # no box specified for this hand → skip
-                        continue
+                # elif not np.any(contact_seq[t:t+3] > 0.5):
+                #     box_def = HAND_COLLISION_BOX.get(name, None)
+                #     if box_def is None:
+                #         # no box specified for this hand → skip
+                #         continue
 
-                    center_B = ca.DM(box_def["center"].reshape(3, 1))      # 3x1
-                    half_B   = ca.DM(box_def["half_size"].reshape(3, 1))   # 3x1
+                #     center_B = ca.DM(box_def["center"].reshape(3, 1))      # 3x1
+                #     half_B   = ca.DM(box_def["half_size"].reshape(3, 1))   # 3x1
 
-                    # Ball center in hand frame
-                    delta_W = p_WC_des - p_WB               # 3x1 MX
-                    p_B = R_WB.T @ delta_W                  # 3x1 MX
+                #     # Ball center in hand frame
+                #     delta_W = p_WC_des - p_WB               # 3x1 MX
+                #     p_B = R_WB.T @ delta_W                  # 3x1 MX
 
-                    # Distance from point p_B to axis-aligned box in hand frame
-                    # centered at 'center_B' with half-sizes 'half_B':
-                    #   d = || max(0, |p_B - center_B| - half_B) ||
-                    diff_local  = p_B - center_B           # 3x1
-                    abs_diff = ca.fabs(diff_local)      # 3x1
-                    zero_vec = ca.DM.zeros(3, 1)
-                    excess = ca.fmax(zero_vec, abs_diff - half_B)  # 3x1 MX
+                #     # Distance from point p_B to axis-aligned box in hand frame
+                #     # centered at 'center_B' with half-sizes 'half_B':
+                #     #   d = || max(0, |p_B - center_B| - half_B) ||
+                #     diff_local  = p_B - center_B           # 3x1
+                #     abs_diff = ca.fabs(diff_local)      # 3x1
+                #     zero_vec = ca.DM.zeros(3, 1)
+                #     excess = ca.fmax(zero_vec, abs_diff - half_B)  # 3x1 MX
 
-                    dist_box_sq = ca.sumsqr(excess)          # scalar MX ≥ 0
+                #     dist_box_sq = ca.sumsqr(excess)          # scalar MX ≥ 0
 
-                    # Hard inequality on squared distance
-                    opti.subject_to(dist_box_sq >= (BALL_RADIUS+0.01)**2)
+                #     # Hard inequality on squared distance
+                #     opti.subject_to(dist_box_sq >= (BALL_RADIUS+0.01)**2)
 
                     
 
