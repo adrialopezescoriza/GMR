@@ -31,7 +31,7 @@ def build_and_solve_ball_optimization(
     v_ref: np.ndarray,
     body_contact_flags: np.ndarray,
     ground_contact_flags: np.ndarray,
-    link_pos_world_offset: np.ndarray,
+    link_pos_world_offsets: np.ndarray,
     fps: int,
     g_vec: np.ndarray = np.array([0.0, 0.0, -9.81]),
     speed_thresh: float = 0.05,  # threshold for "ball is moving"
@@ -48,7 +48,7 @@ def build_and_solve_ball_optimization(
       Otherwise:
         * Use cosine-difference cost between v_k and v_ref[k]
     - Contact constraints (unchanged):
-        * Body contact: p = link_pos + hand_offset
+        * Body contact: p = link_pos + hand_offset (for each contact link)
         * Ground contact: p_z <= 0.12, v_z = 0
     """
 
@@ -130,6 +130,9 @@ def build_and_solve_ball_optimization(
     # ---------------- contact constraints and cost ---------------- #
 
     body_contact_weight = 500.0  # you can tune this (50–2000)
+    link_pos_world_offsets = np.asarray(link_pos_world_offsets, dtype=float)
+    if link_pos_world_offsets.ndim == 2:
+        link_pos_world_offsets = link_pos_world_offsets[:, None, :]
 
     for k in range(T):
         x_k = X[:, k]
@@ -137,10 +140,10 @@ def build_and_solve_ball_optimization(
         v_k = x_k[3:6]
 
         if body_contact_flags[k]:
-            link_p_k = ca.DM(link_pos_world_offset[k])  # (3,)
-            desired_p = link_p_k
-            diff = p_k - desired_p
-            J = J + body_contact_weight * ca.sumsqr(diff)
+            for c in range(link_pos_world_offsets.shape[1]):
+                link_p_k = ca.DM(link_pos_world_offsets[k, c])  # (3,)
+                diff = p_k - link_p_k
+                J = J + body_contact_weight * ca.sumsqr(diff)
 
         if ground_contact_flags[k]:
             # GROUND contact:
@@ -212,13 +215,16 @@ def build_and_solve_ball_optimization(
 
 def optimize_object_traj_from_motion(
     motion_data: dict,
+    contact_link_names=None,
+    local_offsets=None,
     contact_link_name: str = "right_rubber_hand",
     local_offset: np.ndarray = np.array([0.0, 0.0, 0.0]),
     speed_thresh: float = 0.05,
 ):
     """
     Given a motion_data dict, build the inputs for `build_and_solve_ball_optimization`
-    and return optimized object positions and velocities.
+    and return optimized object positions and velocities. Supports multiple contact
+    links and offsets.
 
     motion_data keys expected:
         - "fps"
@@ -245,42 +251,67 @@ def optimize_object_traj_from_motion(
     world_body_orient = np.asarray(motion_data["world_body_orient"], dtype=float) # (T_body, N_links, 4)
     link_names = list(motion_data["link_body_list"])
 
-    # --- Choose link index for body contact ---
-    if contact_link_name in link_names:
-        link_idx = link_names.index(contact_link_name)
+    # --- Normalize contact link inputs ---
+    if contact_link_names is None:
+        contact_link_names = [contact_link_name]
+    elif isinstance(contact_link_names, str):
+        contact_link_names = [contact_link_names]
     else:
-        # Fallback: last link if not found
-        print(
-            f"[WARN] Link '{contact_link_name}' not found in link_body_list. "
-            f"Available links include e.g. {link_names[:5]}... Using last link instead."
+        contact_link_names = list(contact_link_names)
+
+    if local_offsets is None:
+        local_offsets = [local_offset for _ in contact_link_names]
+    else:
+        local_offsets = np.asarray(local_offsets, dtype=float)
+        if local_offsets.ndim == 1 and local_offsets.shape[0] == 3:
+            local_offsets = [local_offsets]
+        else:
+            local_offsets = list(local_offsets)
+        if len(local_offsets) == 1 and len(contact_link_names) > 1:
+            local_offsets = local_offsets * len(contact_link_names)
+
+    if len(contact_link_names) != len(local_offsets):
+        raise ValueError(
+            f"Expected contact_link_names and local_offsets to have the same length, "
+            f"got {len(contact_link_names)} and {len(local_offsets)}."
         )
-        link_idx = len(link_names) - 1
 
     T_ball = p_ref.shape[0]
     T_body, N_links, _ = world_body_pos.shape
 
-    # --- Build link_pos aligned with object trajectory length ---
-    link_pos = np.zeros((T_ball, 3), dtype=float)
-    link_orient = np.zeros((T_ball, 4), dtype=float)
-
+    # --- Build link_pos aligned with object trajectory length for each contact link ---
+    link_pos_world_offsets = np.zeros((T_ball, len(contact_link_names), 3), dtype=float)
     T_min = min(T_ball, T_body)
-    link_pos[:T_min] = world_body_pos[:T_min, link_idx, :]
-    link_orient[:T_min] = world_body_orient[:T_min, link_idx, :]
 
-    # Repeat last pose if object is longer than body sequence
-    if T_ball > T_body:
-        link_pos[T_body:] = world_body_pos[T_body - 1, link_idx, :]
-        link_orient[T_body:] = world_body_orient[T_body - 1, link_idx, :]
+    for c, (contact_link, local_offset) in enumerate(zip(contact_link_names, local_offsets)):
+        if contact_link in link_names:
+            link_idx = link_names.index(contact_link)
+        else:
+            print(
+                f"[WARN] Link '{contact_link}' not found in link_body_list. "
+                f"Available links include e.g. {link_names[:5]}... Using last link instead."
+            )
+            link_idx = len(link_names) - 1
 
-    # --- Convert link offset into world frame each timestep ---
-    world_offset = np.zeros((T_ball, 3), dtype=float)
-    for t in range(T_ball):
-        q = link_orient[t,[1,2,3,0]]  # quaternion (x, y, z, w)
-        rot = R.from_quat(q)
-        world_offset[t] = rot.apply(local_offset)
+        link_pos = np.zeros((T_ball, 3), dtype=float)
+        link_orient = np.zeros((T_ball, 4), dtype=float)
+        link_pos[:T_min] = world_body_pos[:T_min, link_idx, :]
+        link_orient[:T_min] = world_body_orient[:T_min, link_idx, :]
 
-    # Final desired link positions = hand position + rotated offset
-    link_pos_world_offset = link_pos + world_offset
+        # Repeat last pose if object is longer than body sequence
+        if T_ball > T_body:
+            link_pos[T_body:] = world_body_pos[T_body - 1, link_idx, :]
+            link_orient[T_body:] = world_body_orient[T_body - 1, link_idx, :]
+
+        # Convert link offset into world frame each timestep
+        local_offset = np.asarray(local_offset, dtype=float).reshape(3,)
+        world_offset = np.zeros((T_ball, 3), dtype=float)
+        for t in range(T_ball):
+            q = link_orient[t, [1, 2, 3, 0]]  # quaternion (x, y, z, w)
+            rot = R.from_quat(q)
+            world_offset[t] = rot.apply(local_offset)
+
+        link_pos_world_offsets[:, c, :] = link_pos + world_offset
 
     # --- Reference velocities from positions ---
     dt = 1.0 / float(fps)
@@ -292,10 +323,9 @@ def optimize_object_traj_from_motion(
         v_ref=v_ref,
         body_contact_flags=body_contact_flags,
         ground_contact_flags=ground_contact_flags,
-        link_pos_world_offset=link_pos_world_offset,
+        link_pos_world_offsets=link_pos_world_offsets,
         fps=fps,
         speed_thresh=speed_thresh,
     )
 
     return p_opt, v_opt
-

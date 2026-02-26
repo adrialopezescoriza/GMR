@@ -11,6 +11,13 @@ import meshcat.transformations as tf
 import os
 import pickle
 
+from general_motion_retargeting.rot_utils import (
+    rot_from_quat_wxyz,
+    quat_conjugate_wxyz,
+    quat_mul_wxyz,
+    axis_angle_from_quat_wxyz,
+)
+
 URDF_PATH = "assets/unitree_g1/g1_29dof_w_hands.urdf"
 OBJECT_URDF_PATH = "assets/objects/basketball.urdf"
 BASE_JOINT_NAME = "pelvis"
@@ -38,10 +45,11 @@ LINK_TRACKING_WEIGHTS_B = {
     "left_elbow_link": 1.0,
     "right_shoulder_yaw_link": 1.0,
     "left_shoulder_yaw_link": 1.0,
+    # "left_ankle_pitch_link": 1.0,
+    # "right_ankle_pitch_link": 1.0,
+    "left_knee_link": 1.0,
+    "right_knee_link": 1.0,
 }
-
-STATIONARY_BODIES = ["left_ankle_roll_link", "right_ankle_roll_link"]
-STATIONARY_SPEED_THRESH = 0.02  # [m/s] tune (e.g., 0.02–0.10)
 
 JOINT_TRACKING_WEIGHTS = {
     # # 'left_hip_pitch_joint': 1.0, 
@@ -76,7 +84,7 @@ JOINT_TRACKING_WEIGHTS = {
 }
 
 CONTACT_POINTS_O_LOCAL = {
-    "left_rubber_hand":  np.array([0.07, -0.11, 0.05]),
+    # "left_rubber_hand":  np.array([0.07, -0.11, 0.05]),
     "right_rubber_hand": np.array([0.07, 0.11, 0.05]),
 } # object center position in hand frame
 
@@ -109,19 +117,6 @@ VELOCITY_REG_WEIGHT = 5e-4
 # -------------------------------------------------------------------
 # Small utilities
 # -------------------------------------------------------------------
-def rot_from_quat_wxyz(q):
-    """
-    Quaternion q = [w, x, y, z] -> 3x3 rotation matrix (NumPy).
-    """
-    w, x, y, z = q
-    ww, xx, yy, zz = w*w, x*x, y*y, z*z
-    R = np.array([
-        [ww + xx - yy - zz, 2*(x*y - w*z),     2*(x*z + w*y)],
-        [2*(x*y + w*z),     ww - xx + yy - zz, 2*(y*z - w*x)],
-        [2*(x*z - w*y),     2*(y*z + w*x),     ww - xx - yy + zz]
-    ])
-    return R
-
 def obj_point_world(obj_pos, obj_quat, p_OQ):
     """
     Compute world position of a point Q on the object:
@@ -159,66 +154,6 @@ def quat_wxyz_from_pin(q_pin):
     qw = q_pin[3]
     return ca.vertcat(qw, qx, qy, qz)
 
-
-def quat_conjugate_wxyz(q):
-    """Conjugate of quaternion [qw,qx,qy,qz]."""
-    qw = q[0]
-    qx = q[1]
-    qy = q[2]
-    qz = q[3]
-    return ca.vertcat(qw, -qx, -qy, -qz)
-
-
-def quat_mul_wxyz(q1, q2):
-    """
-    Hamilton product q = q1 * q2, both in [qw,qx,qy,qz] convention.
-    q1, q2: 4x1 MX/SX
-    """
-    w1, x1, y1, z1 = q1[0], q1[1], q1[2], q1[3]
-    w2, x2, y2, z2 = q2[0], q2[1], q2[2], q2[3]
-
-    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
-    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
-    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
-    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
-    return ca.vertcat(w, x, y, z)
-
-
-def axis_angle_from_quat_wxyz(q, eps=1e-6):
-    """
-    Axis-angle vector from quaternion [qw,qx,qy,qz].
-    Returns a 3x1 MX/SX whose direction is the axis and magnitude is the angle.
-    """
-    # Ensure shortest representation (qw >= 0)
-    qw = q[0]
-    qx = q[1]
-    qy = q[2]
-    qz = q[3]
-
-    sign = ca.if_else(qw < 0, -1.0, 1.0)
-    qw = sign * qw
-    qx = sign * qx
-    qy = sign * qy
-    qz = sign * qz
-
-    mag = ca.sqrt(qx*qx + qy*qy + qz*qz)
-    half_angle = ca.atan2(mag, qw)
-    angle = 2.0 * half_angle
-
-    sin_half = ca.sin(half_angle)
-
-    # sin(theta/2)/theta with Taylor series near 0
-    sin_over_angle = ca.if_else(
-        ca.fabs(angle) > eps,
-        sin_half / angle,
-        0.5 - (angle*angle) / 48.0
-    )
-
-    ax = qx / sin_over_angle
-    ay = qy / sin_over_angle
-    az = qz / sin_over_angle
-
-    return ca.vertcat(ax, ay, az)
 
 def so3_angle_cost(R_ref_DM: ca.DM, R_sym) -> ca.MX:
     """
@@ -584,31 +519,31 @@ class PinocchioContactProjector:
                 # Contact position cost
                 if contact_seq[t] > 0.5:
                     total_cost += CONTACT_POS_COST_WEIGHT * ca.sumsqr(p_WC_pred - p_WC_des)
-                # elif not np.any(contact_seq[t:t+3] > 0.5):
-                #     box_def = HAND_COLLISION_BOX.get(name, None)
-                #     if box_def is None:
-                #         # no box specified for this hand → skip
-                #         continue
+                elif not np.any(contact_seq[t:t+3] > 0.5):
+                    box_def = HAND_COLLISION_BOX.get(name, None)
+                    if box_def is None:
+                        # no box specified for this hand → skip
+                        continue
 
-                #     center_B = ca.DM(box_def["center"].reshape(3, 1))      # 3x1
-                #     half_B   = ca.DM(box_def["half_size"].reshape(3, 1))   # 3x1
+                    center_B = ca.DM(box_def["center"].reshape(3, 1))      # 3x1
+                    half_B   = ca.DM(box_def["half_size"].reshape(3, 1))   # 3x1
 
-                #     # Ball center in hand frame
-                #     delta_W = p_WC_des - p_WB               # 3x1 MX
-                #     p_B = R_WB.T @ delta_W                  # 3x1 MX
+                    # Ball center in hand frame
+                    delta_W = p_WC_des - p_WB               # 3x1 MX
+                    p_B = R_WB.T @ delta_W                  # 3x1 MX
 
-                #     # Distance from point p_B to axis-aligned box in hand frame
-                #     # centered at 'center_B' with half-sizes 'half_B':
-                #     #   d = || max(0, |p_B - center_B| - half_B) ||
-                #     diff_local  = p_B - center_B           # 3x1
-                #     abs_diff = ca.fabs(diff_local)      # 3x1
-                #     zero_vec = ca.DM.zeros(3, 1)
-                #     excess = ca.fmax(zero_vec, abs_diff - half_B)  # 3x1 MX
+                    # Distance from point p_B to axis-aligned box in hand frame
+                    # centered at 'center_B' with half-sizes 'half_B':
+                    #   d = || max(0, |p_B - center_B| - half_B) ||
+                    diff_local  = p_B - center_B           # 3x1
+                    abs_diff = ca.fabs(diff_local)      # 3x1
+                    zero_vec = ca.DM.zeros(3, 1)
+                    excess = ca.fmax(zero_vec, abs_diff - half_B)  # 3x1 MX
 
-                #     dist_box_sq = ca.sumsqr(excess)          # scalar MX ≥ 0
+                    dist_box_sq = ca.sumsqr(excess)          # scalar MX ≥ 0
 
-                #     # Hard inequality on squared distance
-                #     opti.subject_to(dist_box_sq >= (BALL_RADIUS+0.01)**2)
+                    # Hard inequality on squared distance
+                    opti.subject_to(dist_box_sq >= (BALL_RADIUS+0.01)**2)
 
                     
 
@@ -787,7 +722,7 @@ def process_one_file(projector: PinocchioContactProjector, in_path: str, out_dir
 
 if __name__ == "__main__":
     urdf_path = URDF_PATH
-    folder = "data/g1_skillmimic/pick_40"
+    folder = "data/g1_skillmimic/rrun"
     projected_folder = os.path.join(folder, "projected")
 
     # Make sure the projected folder exists

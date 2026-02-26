@@ -7,6 +7,13 @@ from scipy.interpolate import interp1d
 
 import general_motion_retargeting.utils.lafan_vendor.utils as utils
 
+SKILLMIMIC_INDEX_MAP = torch.tensor([
+    0, 1, 5, 10, 2, 6, 11, 3, 7, 12, 4, 8, 13, 15, 34, 14,
+    16, 35, 17, 36, 18, 37, 9, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31, 32, 33, 38, 39, 40, 41, 42, 43,
+    44, 45, 46, 47, 48, 49, 50, 51, 52
+])
+
 def load_smpl_file(smpl_file):
     smpl_data = np.load(smpl_file, allow_pickle=True)
     return smpl_data
@@ -45,6 +52,79 @@ def load_smplx_file(smplx_file, smplx_body_model_path):
         human_height = 1.66 + 0.1 * smplx_data["betas"][0, 0]
     
     return smplx_data, body_model, smplx_output, human_height
+
+
+def load_smplx_data(smplx_data, smplx_body_model_path):
+    body_model = smplx.create(
+        smplx_body_model_path,
+        "smplx",
+        gender=str(smplx_data["gender"]),
+        use_pca=False,
+    )
+
+    num_frames = smplx_data["pose_body"].shape[0]
+    smplx_output = body_model(
+        betas=torch.tensor(smplx_data["betas"]).float().view(1, -1),
+        global_orient=torch.tensor(smplx_data["root_orient"]).float(),
+        body_pose=torch.tensor(smplx_data["pose_body"]).float(),
+        transl=torch.tensor(smplx_data["trans"]).float(),
+        left_hand_pose=torch.zeros(num_frames, 45).float(),
+        right_hand_pose=torch.zeros(num_frames, 45).float(),
+        jaw_pose=torch.zeros(num_frames, 3).float(),
+        leye_pose=torch.zeros(num_frames, 3).float(),
+        reye_pose=torch.zeros(num_frames, 3).float(),
+        return_full_pose=True,
+    )
+
+    if len(smplx_data["betas"].shape) == 1:
+        human_height = 1.66 + 0.1 * smplx_data["betas"][0]
+    else:
+        human_height = 1.66 + 0.1 * smplx_data["betas"][0, 0]
+
+    obj_data = None
+    if "obj_state" in smplx_data:
+        obj_data = {
+            "pos": smplx_data["obj_state"][:, :3],
+            "rot": smplx_data["obj_state"][:, 3:6],
+            "contact": smplx_data["obj_contact"][:, :],
+        }
+
+    return body_model, smplx_output, human_height, obj_data
+
+
+def convert_skillmimic_to_smplx(input_path, gender="neutral"):
+    smpl_data = torch.load(input_path).to(torch.device("cpu")).numpy()
+    data_dict = {
+        "trans": smpl_data[:, 0:3],
+        "poses": smpl_data[:, 3:],
+        "mocap_framerate": np.array(60),
+    }
+
+    if "betas" in data_dict:
+        betas = data_dict["betas"]
+        if betas.shape == (10,):
+            data_dict["betas"] = np.concatenate([betas, np.zeros(6, dtype=betas.dtype)])
+        elif betas.shape not in [(16,), (1, 16)]:
+            raise ValueError(f"Unexpected betas shape: {betas.shape}.")
+    else:
+        data_dict["betas"] = np.zeros(16, dtype=np.float32)
+
+    data_dict["mocap_frame_rate"] = data_dict.pop("mocap_framerate")
+
+    poses = data_dict["poses"]
+    reindex_map = 3 + torch.cat(
+        [3 * SKILLMIMIC_INDEX_MAP[:, None] + i for i in range(3)], dim=1
+    ).flatten()
+    poses[:, 3:(54 * 3)] = poses[:, reindex_map]
+
+    data_dict["obj_state"] = smpl_data[:, 324:330]
+    data_dict["obj_contact"] = smpl_data[:, 336:337]
+    data_dict["root_orient"] = poses[:, :3]
+    data_dict["pose_body"] = poses[:, 6:69]
+    data_dict["gender"] = np.array(gender)
+
+    del data_dict["poses"]
+    return data_dict
 
 
 def load_gvhmr_pred_file(gvhmr_pred_file, smplx_body_model_path):

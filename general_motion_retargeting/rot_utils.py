@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import casadi as ca
 from scipy.spatial.transform import Rotation as R
 
 
@@ -166,3 +167,113 @@ def quat_diff_np(q1, q2, scalar_first=True):
     rotvec = r_rel.as_rotvec()  # returns angle * axis vector
 
     return rotvec
+
+
+def rot_from_quat_wxyz(q):
+    """
+    Quaternion [w, x, y, z] -> 3x3 rotation matrix (NumPy).
+    """
+    w, x, y, z = q
+    ww, xx, yy, zz = w * w, x * x, y * y, z * z
+    return np.array([
+        [ww + xx - yy - zz, 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), ww - xx + yy - zz, 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), ww - xx - yy + zz],
+    ])
+
+
+def quat_conjugate_wxyz(q):
+    """
+    Conjugate of quaternion [w, x, y, z] for NumPy or CasADi types.
+    """
+    if isinstance(q, (ca.MX, ca.SX, ca.DM)):
+        return ca.vertcat(q[0], -q[1], -q[2], -q[3])
+    q = np.asarray(q)
+    return np.array([q[0], -q[1], -q[2], -q[3]])
+
+
+def quat_mul_wxyz(q1, q2):
+    """
+    Hamilton product q = q1 * q2 for [w, x, y, z] (NumPy or CasADi).
+    """
+    if isinstance(q1, (ca.MX, ca.SX, ca.DM)) or isinstance(q2, (ca.MX, ca.SX, ca.DM)):
+        w1, x1, y1, z1 = q1[0], q1[1], q1[2], q1[3]
+        w2, x2, y2, z2 = q2[0], q2[1], q2[2], q2[3]
+        return ca.vertcat(
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        )
+    return quat_mul_np(np.asarray(q1), np.asarray(q2), scalar_first=True)
+
+
+def axis_angle_from_quat_wxyz(q, eps: float = 1e-6):
+    """
+    Axis-angle vector (axis * angle) from quaternion [w, x, y, z].
+    Works with CasADi or NumPy.
+    """
+    if isinstance(q, (ca.MX, ca.SX, ca.DM)):
+        qw, qx, qy, qz = q[0], q[1], q[2], q[3]
+        sign = ca.if_else(qw < 0, -1.0, 1.0)
+        qw = sign * qw
+        qx = sign * qx
+        qy = sign * qy
+        qz = sign * qz
+
+        mag = ca.sqrt(qx * qx + qy * qy + qz * qz)
+        half_angle = ca.atan2(mag, qw)
+        angle = 2.0 * half_angle
+        sin_half = ca.sin(half_angle)
+        sin_over_angle = ca.if_else(
+            ca.fabs(angle) > eps,
+            sin_half / angle,
+            0.5 - (angle * angle) / 48.0,
+        )
+        return ca.vertcat(qx / sin_over_angle, qy / sin_over_angle, qz / sin_over_angle)
+
+    q = np.asarray(q, dtype=float)
+    if q[0] < 0:
+        q = -q
+    qw, qx, qy, qz = q
+    mag = np.linalg.norm([qx, qy, qz])
+    if mag < eps:
+        return np.zeros(3)
+    angle = 2.0 * np.arctan2(mag, qw)
+    axis = np.array([qx, qy, qz]) / mag
+    return axis * angle
+
+
+def finite_difference_velocities(positions: np.ndarray, dt: float) -> np.ndarray:
+    """
+    Simple finite-difference velocities for a (T, 3) position array.
+    Central differences for interior points, forward/backward for endpoints.
+    """
+    T, _ = positions.shape
+    vel = np.zeros_like(positions)
+    if T < 2:
+        return vel
+    vel[1:-1] = (positions[2:] - positions[:-2]) / (2.0 * dt)
+    vel[0] = (positions[1] - positions[0]) / dt
+    vel[-1] = (positions[-1] - positions[-2]) / dt
+    return vel
+
+
+def pad_or_truncate(seq: np.ndarray, target_len: int) -> np.ndarray:
+    seq = np.asarray(seq)
+    if seq.shape[0] == target_len:
+        return seq
+    if seq.shape[0] > target_len:
+        return seq[:target_len]
+    pad = np.repeat(seq[-1:], target_len - seq.shape[0], axis=0)
+    return np.concatenate([seq, pad], axis=0)
+
+
+def pad_or_truncate_1d(seq: np.ndarray, target_len: int) -> np.ndarray:
+    seq = np.asarray(seq).reshape(-1)
+    if seq.shape[0] == target_len:
+        return seq
+    if seq.shape[0] > target_len:
+        return seq[:target_len]
+    pad = np.repeat(seq[-1], target_len - seq.shape[0], axis=0)
+    return np.concatenate([seq, pad], axis=0)
