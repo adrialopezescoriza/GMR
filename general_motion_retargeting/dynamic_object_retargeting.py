@@ -280,13 +280,12 @@ def optimize_object_traj_from_motion(
             link_pos[T_body:] = world_body_pos[T_body - 1, link_idx, :]
             link_orient[T_body:] = world_body_orient[T_body - 1, link_idx, :]
 
-        # Convert link offset into world frame each timestep
-        local_offset = np.asarray(local_offset, dtype=float).reshape(3,)
-        world_offset = np.zeros((T_ball, 3), dtype=float)
-        for t in range(T_ball):
-            q = link_orient[t, [1, 2, 3, 0]]  # quaternion (x, y, z, w)
-            rot = R.from_quat(q)
-            world_offset[t] = rot.apply(local_offset)
+        # Convert link offsets into world frame each timestep
+        local_offset = np.asarray(local_offset, dtype=float)
+        local_offset_k = np.zeros((T_ball, 3), dtype=float)
+        T_off = min(T_ball, local_offset.shape[0])
+        local_offset_k[:T_off] = local_offset[:T_off]
+        world_offset = R.from_quat(link_orient[:, [1, 2, 3, 0]]).apply(local_offset_k)
 
         link_pos_world_offsets[:, c, :] = link_pos + world_offset
 

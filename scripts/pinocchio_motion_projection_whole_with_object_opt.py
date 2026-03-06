@@ -151,9 +151,17 @@ class PinocchioContactProjector:
         g_vec_dm = ca.DM(OBJECT_GRAVITY)
         zero3 = ca.DM.zeros(3, 1)
 
+        contact_offsets = {}
+        for link_name in self.contact_links:
+            if "left" in link_name and "object_pos_in_left_hand_frame" in motion_data:
+                contact_offsets[link_name] = -np.asarray(motion_data["object_pos_in_left_hand_frame"])
+            elif "right" in link_name and "object_pos_in_right_hand_frame" in motion_data:
+                contact_offsets[link_name] = -np.asarray(motion_data["object_pos_in_right_hand_frame"])
+            else:
+                contact_offsets[link_name] = np.zeros((N, 3), dtype=np.float32)
         contact_offsets_dm = {
-            name: ca.DM(offset.reshape(3, 1))
-            for name, offset in CONTACT_POINTS_O_LOCAL.items()
+            name: ca.DM(offset)
+            for name, offset in contact_offsets.items()
         }
 
         opti = ca.Opti()
@@ -259,7 +267,7 @@ class PinocchioContactProjector:
                         continue
                     p_WB = self.robot.world_pos(name, q_t)
                     R_WB = self.robot.world_rotmat(name, q_t)
-                    p_WC_des = p_WB + R_WB @ p_BC_DM
+                    p_WC_des = p_WB + R_WB @ p_BC_DM[t, :].T
                     # Cost: keep ball at contact point during contact frames.
                     total_cost += OBJECT_CONTACT_WEIGHT * ca.sumsqr(p_object_t - p_WC_des)
 

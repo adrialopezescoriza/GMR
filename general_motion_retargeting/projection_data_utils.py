@@ -151,11 +151,26 @@ def _build_motion_data_from_source_frames(
     robot: str,
     actual_human_height: Optional[float],
     device: Optional[str],
-    contact_points_o_local: Dict[str, np.ndarray],
+    contact_links: list[str],
     object_speed_thresh: float,
 ) -> Dict[str, Any]:
     if not smplx_frames:
         raise ValueError("Empty motion sequence.")
+
+    T = len(smplx_frames)
+    object_pos = pad_or_truncate(np.asarray(object_pos, dtype=np.float32), T)
+    object_rot_wxyz = pad_or_truncate(np.asarray(object_rot_wxyz, dtype=np.float32), T)
+    object_contact = pad_or_truncate(np.asarray(object_contact, dtype=np.float32).reshape(-1, 1), T)
+    m = (object_contact > 0.5).astype(np.float32)
+    left_hand_pos_world = np.asarray([f["left_index3"][0] for f in smplx_frames], dtype=np.float32)
+    right_hand_pos_world = np.asarray([f["right_index3"][0] for f in smplx_frames], dtype=np.float32)
+    left_hand_rot_wxyz = np.asarray([f["left_index3"][1] for f in smplx_frames], dtype=np.float32)
+    right_hand_rot_wxyz = np.asarray([f["right_index3"][1] for f in smplx_frames], dtype=np.float32)
+    object_pos_in_left_hand_frame = R.from_quat(left_hand_rot_wxyz[:, [1, 2, 3, 0]]).inv().apply(object_pos - left_hand_pos_world)[:, [1, 0, 2]]
+    object_pos_in_right_hand_frame = R.from_quat(right_hand_rot_wxyz[:, [1, 2, 3, 0]]).inv().apply(object_pos - right_hand_pos_world)[:, [1, 0, 2]]
+
+    object_pos_in_left_hand_frame[m[:, 0] > 0.5] = object_pos_in_left_hand_frame[m[:, 0] > 0.5].mean(axis=0)
+    object_pos_in_right_hand_frame[m[:, 0] > 0.5] = object_pos_in_right_hand_frame[m[:, 0] > 0.5].mean(axis=0)
 
     retarget = GeneralMotionRetargeting(
         actual_human_height=actual_human_height,
@@ -226,17 +241,21 @@ def _build_motion_data_from_source_frames(
         "object_rot": object_rot_wxyz,
         "contact_sequence": np.round(object_contact).astype(np.int8),
         "ground_contact_sequence": np.round(object_ground_contact).astype(np.int8),
+        "object_pos_in_left_hand_frame": object_pos_in_left_hand_frame,
+        "object_pos_in_right_hand_frame": object_pos_in_right_hand_frame,
     }
 
-    if not contact_points_o_local:
+    contact_link_names = list(contact_links)
+    if not contact_link_names:
         return motion_data
 
     try:
         optimized_object_pos, optimized_object_vel = optimize_object_traj_from_motion(
             motion_data=motion_data,
-            contact_link_names=list(contact_points_o_local.keys()),
+            contact_link_names=contact_link_names,
             local_offsets=[
-                contact_points_o_local[name] for name in contact_points_o_local.keys()
+                object_pos_in_left_hand_frame if "left" in name else object_pos_in_right_hand_frame if "right" in name else np.zeros(3, dtype=np.float32)
+                for name in contact_link_names
             ],
             speed_thresh=object_speed_thresh,
         )
