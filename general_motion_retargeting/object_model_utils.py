@@ -5,6 +5,23 @@ from typing import Iterable, Optional
 
 DEFAULT_OBJECT_MODEL_PATH = "assets/objects/basketball.urdf"
 
+OBJECT_MOTION_DEFAULTS = {
+    "basketball": {
+        "min_object_height": 0.13,
+        "contact_links": [
+            "left_hand_middle_0_link",
+            "right_hand_middle_0_link",
+        ],
+    },
+    "largebox": {
+        "min_object_height": 0.5,
+        "contact_links": [
+            "left_hand_middle_0_link",
+            "right_hand_middle_0_link",
+        ],
+    },
+}
+
 
 def _name_candidates(folder_name: str) -> Iterable[str]:
     base = folder_name.strip()
@@ -81,3 +98,12 @@ def resolve_object_model_path(
         return configured_object_model_path
 
     return default_object_model_path
+
+
+def get_object_motion_defaults(object_model_path: str) -> dict:
+    model_name = os.path.splitext(os.path.basename(object_model_path))[0].lower()
+    cfg = OBJECT_MOTION_DEFAULTS.get(model_name, OBJECT_MOTION_DEFAULTS["basketball"])
+    return {
+        "min_object_height": float(cfg["min_object_height"]),
+        "contact_links": list(cfg["contact_links"]),
+    }

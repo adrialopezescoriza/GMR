@@ -277,7 +277,7 @@ def build_projection_motion_data_with_gmr(
     tgt_fps: int = 60,
     device: str,
     min_object_height: float,
-    contact_points_o_local: Optional[Dict[str, np.ndarray]],
+    contact_links: Optional[list[str]],
     object_speed_thresh: float,
 ) -> Tuple[Dict[str, Any], str]:
 
@@ -298,7 +298,7 @@ def build_projection_motion_data_with_gmr(
         robot=robot,
         actual_human_height=source_data["actual_human_height"],
         device=device,
-        contact_points_o_local=contact_points_o_local or {},
+        contact_links=contact_links or [],
         object_speed_thresh=object_speed_thresh,
     )
     return motion_data, source_name

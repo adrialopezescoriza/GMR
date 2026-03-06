@@ -215,10 +215,8 @@ def build_and_solve_ball_optimization(
 
 def optimize_object_traj_from_motion(
     motion_data: dict,
-    contact_link_names=None,
-    local_offsets=None,
-    contact_link_name: str = "right_rubber_hand",
-    local_offset: np.ndarray = np.array([0.0, 0.0, 0.0]),
+    contact_link_names: list,
+    local_offsets: np.ndarray,
     speed_thresh: float = 0.05,
 ):
     """

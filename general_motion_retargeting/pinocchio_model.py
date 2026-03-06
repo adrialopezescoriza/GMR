@@ -95,7 +95,7 @@ def _load_object_visual_urdf(
         radius = float(sphere.attrib["radius"])
         shape = g.Sphere(radius)
     elif box is not None:
-        size = _parse_float_list(box.attrib.get("size"), 3, [2 * ball_radius] * 3)
+        size = _parse_float_list(box.attrib.get("size"), 3, [2 * object_radius] * 3)
         shape = g.Box(size)
     elif cylinder is not None:
         radius = float(cylinder.attrib["radius"])
@@ -123,7 +123,7 @@ def _load_object_visual_urdf(
 
 def _load_object_visual_mjcf(
     model_path: str,
-    ball_radius: float,
+    object_radius: float,
     default_object_color: int,
 ) -> Tuple[object, g.MeshLambertMaterial, np.ndarray]:
     root = ET.parse(model_path).getroot()
@@ -151,7 +151,7 @@ def _load_object_visual_mjcf(
 
     geom_type = geom.attrib.get("type", "sphere").lower()
     size = _parse_float_list(
-        geom.attrib.get("size"), 3, [ball_radius, ball_radius, ball_radius]
+        geom.attrib.get("size"), 3, [object_radius, object_radius, object_radius]
     )
 
     local_tf = np.eye(4)
@@ -191,12 +191,12 @@ def _load_object_visual_mjcf(
 
 def load_object_visual(
     object_model_path: Optional[str],
-    ball_radius: float = 0.12,
+    object_radius: float = 0.12,
     default_object_color: int = 0xFF8000,
 ) -> Tuple[object, g.MeshLambertMaterial, np.ndarray, Optional[str]]:
     if object_model_path is None:
         return (
-            g.Sphere(ball_radius),
+            g.Sphere(object_radius),
             g.MeshLambertMaterial(color=default_object_color),
             np.eye(4),
             None,
@@ -206,11 +206,11 @@ def load_object_visual(
     ext = os.path.splitext(model_path)[1].lower()
     if ext == ".urdf":
         geom, mat, local_tf = _load_object_visual_urdf(
-            model_path, ball_radius, default_object_color
+            model_path, object_radius, default_object_color
         )
     elif ext == ".xml":
         geom, mat, local_tf = _load_object_visual_mjcf(
-            model_path, ball_radius, default_object_color
+            model_path, object_radius, default_object_color
         )
     elif ext in (".obj", ".stl", ".dae"):
         geom = _mesh_geometry_from_file(model_path)
@@ -230,7 +230,7 @@ class PinocchioCasadiRobot:
         urdf_path: str,
         object_model_path: Optional[str] = None,
         base_body_name: str = "pelvis",
-        ball_radius: float = 0.12,
+        object_radius: float = 0.12,
         default_object_color: int = 0xFF8000,
         package_dirs: Optional[List[str]] = None,
     ):
@@ -313,27 +313,19 @@ class PinocchioCasadiRobot:
         object_mat = None
         object_local_tf = np.eye(4)
         object_model_abs = None
-        try:
-            object_geom, object_mat, object_local_tf, object_model_abs = load_object_visual(
-                object_model_path=object_model_path,
-                ball_radius=ball_radius,
-                default_object_color=default_object_color,
-            )
-        except Exception as e:
-            print(
-                f"[WARN] Failed to load object model '{object_model_path}': {e}. "
-                f"Using default sphere radius {ball_radius}."
-            )
-            object_geom = g.Sphere(ball_radius)
-            object_mat = g.MeshLambertMaterial(color=default_object_color)
-            object_local_tf = np.eye(4)
-            object_model_abs = None
+        
+        # Visual of the object
+        object_geom, object_mat, object_local_tf, object_model_abs = load_object_visual(
+            object_model_path=object_model_path,
+            object_radius=object_radius,
+            default_object_color=default_object_color,
+        )
 
         shared_key = (
             os.path.abspath(urdf_path),
             object_model_abs,
             self.base_body_name,
-            float(ball_radius),
+            float(object_radius),
             int(default_object_color),
         )
         if (

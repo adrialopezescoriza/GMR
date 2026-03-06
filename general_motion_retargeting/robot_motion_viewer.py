@@ -317,11 +317,17 @@ class RobotMotionViewer:
             self.viewer.cam.elevation = -10  # 正面视角，轻微向下看
             # self.viewer.cam.azimuth = 180    # 正面朝向机器人
         
-        if human_motion_data is not None:
+        if human_motion_data is not None or object_data is not None:
             # Clean custom geometry
             self.viewer.user_scn.ngeom = 0
         if object_data is not None:
             draw_object(self.viewer, self.object_draw_spec, object_data)
+            draw_frame(
+                object_data[0],
+                R.from_quat(object_data[1], scalar_first=True).as_matrix(),
+                self.viewer,
+                0.8,
+            )
         # Draw the task targets for reference
         if human_motion_data is not None:
             for human_body_name, (pos, rot) in human_motion_data.items():

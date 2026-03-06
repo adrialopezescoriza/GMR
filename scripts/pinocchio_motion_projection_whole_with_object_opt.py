@@ -72,7 +72,6 @@ KINEMATIC_CONSISTENCY_WEIGHT = 1.0
 VELOCITY_REG_WEIGHT = 5e-4
 
 BALL_RADIUS = 0.12
-MIN_BALL_HEIGHT = 0.13
 OBJECT_GRAVITY = np.array([0.0, 0.0, -9.81])
 OBJECT_SPEED_THRESH = 0.05
 OBJECT_CONTACT_WEIGHT = 500.0
@@ -87,7 +86,7 @@ class PinocchioContactProjector:
         urdf_path,
         object_model_path,
         min_object_height,
-        contact_points_o_local=None,
+        contact_links=None,
     ):
         self.robot = PinocchioCasadiRobot(
             urdf_path,
@@ -96,6 +95,8 @@ class PinocchioContactProjector:
             object_radius=BALL_RADIUS,
         )
         self.base_body_name = BASE_BODY_NAME
+        self.min_object_height = float(min_object_height)
+        self.contact_links = contact_links or []
 
     def project_motion(self, motion_data: dict) -> dict:
         fps = float(motion_data["fps"])
@@ -525,7 +526,7 @@ def record_motion_video(
                 show_human_body_name=True,
                 human_pos_offset=np.array([0.0, 0.0, 0.0]),
                 object_data=object_data,
-                rate_limit=False,
+                rate_limit=True,
             )
     finally:
         viewer.close()
@@ -549,8 +550,8 @@ def process_file(
             gender=gender,
             tgt_fps=tgt_fps,
             device=device,
-            min_object_height=projector.object_height,
-            contact_points_o_local=projector.contact_points_o_local,
+            min_object_height=projector.min_object_height,
+            contact_links=projector.contact_links,
             object_speed_thresh=OBJECT_SPEED_THRESH,
         )
     print(f"[INFO] Loaded motion source '{source_tag}' from '{in_path}'.")
@@ -611,9 +612,12 @@ def process_folder(
             )
             if object_model_path not in projector_cache:
                 print(f"[INFO] Using object model: {object_model_path}")
+                object_defaults = get_object_motion_defaults(object_model_path)
                 projector_cache[object_model_path] = PinocchioContactProjector(
                     urdf_path=urdf_path,
                     object_model_path=object_model_path,
+                    min_object_height=object_defaults["min_object_height"],
+                    contact_links=object_defaults["contact_links"],
                 )
             projector = projector_cache[object_model_path]
 
@@ -685,9 +689,12 @@ if __name__ == "__main__":
         )
         if object_model_path not in projector_cache:
             print(f"[INFO] Using object model: {object_model_path}")
+            object_defaults = get_object_motion_defaults(object_model_path)
             projector_cache[object_model_path] = PinocchioContactProjector(
                 urdf_path=args.urdf_path,
                 object_model_path=object_model_path,
+                min_object_height=object_defaults["min_object_height"],
+                contact_links=object_defaults["contact_links"],
             )
         projector = projector_cache[object_model_path]
 
