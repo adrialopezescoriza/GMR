@@ -734,6 +734,12 @@
     <parent link="left_wrist_yaw_link"/>
     <child link="left_rubber_hand"/>
   </joint>
+  <joint name="left_hand_middle_0_joint" type="fixed" dont_collapse="true">
+    <origin xyz="0.1192 0.0046 -0.0285" rpy="0 0 0"/>
+    <parent link="left_wrist_yaw_link"/>
+    <child link="left_hand_middle_0_link"/>
+  </joint>
+  <link name="left_hand_middle_0_link"/>
   <link name="left_rubber_hand">
     <inertial>
       <origin xyz="0.05361310808 -0.00295905240 0.00215413091" rpy="0 0 0"/>
@@ -948,6 +954,12 @@
     <parent link="right_wrist_yaw_link"/>
     <child link="right_rubber_hand"/>
   </joint>
+  <joint name="right_hand_middle_0_joint" type="fixed" dont_collapse="true">
+    <origin xyz="0.1192 -0.0046 -0.0285" rpy="0 0 0"/>
+    <parent link="right_wrist_yaw_link"/>
+    <child link="right_hand_middle_0_link"/>
+  </joint>
+  <link name="right_hand_middle_0_link"/>
   <link name="right_rubber_hand">
     <inertial>
       <origin xyz="0.05361310808 0.00295905240 0.00215413091" rpy="0 0 0"/>
