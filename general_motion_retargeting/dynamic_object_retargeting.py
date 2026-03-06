@@ -224,7 +224,7 @@ def optimize_object_traj_from_motion(
     """
     Given a motion_data dict, build the inputs for `build_and_solve_ball_optimization`
     and return optimized object positions and velocities. Supports multiple contact
-    links and offsets.
+    links and offsets `(T,3)` per link).
 
     motion_data keys expected:
         - "fps"
@@ -251,25 +251,6 @@ def optimize_object_traj_from_motion(
     world_body_orient = np.asarray(motion_data["world_body_orient"], dtype=float) # (T_body, N_links, 4)
     link_names = list(motion_data["link_body_list"])
 
-    # --- Normalize contact link inputs ---
-    if contact_link_names is None:
-        contact_link_names = [contact_link_name]
-    elif isinstance(contact_link_names, str):
-        contact_link_names = [contact_link_names]
-    else:
-        contact_link_names = list(contact_link_names)
-
-    if local_offsets is None:
-        local_offsets = [local_offset for _ in contact_link_names]
-    else:
-        local_offsets = np.asarray(local_offsets, dtype=float)
-        if local_offsets.ndim == 1 and local_offsets.shape[0] == 3:
-            local_offsets = [local_offsets]
-        else:
-            local_offsets = list(local_offsets)
-        if len(local_offsets) == 1 and len(contact_link_names) > 1:
-            local_offsets = local_offsets * len(contact_link_names)
-
     if len(contact_link_names) != len(local_offsets):
         raise ValueError(
             f"Expected contact_link_names and local_offsets to have the same length, "
@@ -287,11 +268,7 @@ def optimize_object_traj_from_motion(
         if contact_link in link_names:
             link_idx = link_names.index(contact_link)
         else:
-            print(
-                f"[WARN] Link '{contact_link}' not found in link_body_list. "
-                f"Available links include e.g. {link_names[:5]}... Using last link instead."
-            )
-            link_idx = len(link_names) - 1
+            raise ValueError(f"Contact link '{contact_link}' not found in motion_data['link_body_list'].")
 
         link_pos = np.zeros((T_ball, 3), dtype=float)
         link_orient = np.zeros((T_ball, 4), dtype=float)

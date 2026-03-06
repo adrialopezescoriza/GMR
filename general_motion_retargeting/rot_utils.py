@@ -181,6 +181,20 @@ def rot_from_quat_wxyz(q):
         [2 * (x * z - w * y), 2 * (y * z + w * x), ww - xx - yy + zz],
     ])
 
+def normalize_quat_xyzw_np(
+    q: np.ndarray,
+    eps: float = 1e-8,
+    identity_on_zero: bool = True,
+) -> np.ndarray:
+    q = np.asarray(q)
+    n = np.linalg.norm(q, axis=-1, keepdims=True)
+    out = q / np.maximum(n, eps)
+    if identity_on_zero and q.shape[-1] == 4:
+        valid = n > eps
+        identity = np.zeros_like(out)
+        identity[..., -1] = 1.0
+        out = np.where(valid, out, identity)
+    return out
 
 def quat_conjugate_wxyz(q):
     """

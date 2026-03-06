@@ -2,12 +2,17 @@ import numpy as np
 import smplx
 import torch
 from scipy.spatial.transform import Rotation as R
-from smplx.joint_names import JOINT_NAMES
 from scipy.interpolate import interp1d
+from smplx.joint_names import JOINT_NAMES
+from general_motion_retargeting.utils.intermimic import (
+    build_intermimic_pose_body,
+    load_intermimic_hoi_2d,
+    parse_intermimic_hoi,
+)
 
 import general_motion_retargeting.utils.lafan_vendor.utils as utils
 
-SKILLMIMIC_INDEX_MAP = torch.tensor([
+GYM_TO_SMPL_IDX = torch.tensor([
     0, 1, 5, 10, 2, 6, 11, 3, 7, 12, 4, 8, 13, 15, 34, 14,
     16, 35, 17, 36, 18, 37, 9, 19, 20, 21, 22, 23, 24, 25,
     26, 27, 28, 29, 30, 31, 32, 33, 38, 39, 40, 41, 42, 43,
@@ -93,7 +98,7 @@ def load_smplx_data(smplx_data, smplx_body_model_path):
 
 
 def convert_skillmimic_to_smplx(input_path, gender="neutral"):
-    smpl_data = torch.load(input_path).to(torch.device("cpu")).numpy()
+    smpl_data = torch.load(input_path, weights_only=False).to(torch.device("cpu")).numpy()
     data_dict = {
         "trans": smpl_data[:, 0:3],
         "poses": smpl_data[:, 3:],
@@ -113,7 +118,7 @@ def convert_skillmimic_to_smplx(input_path, gender="neutral"):
 
     poses = data_dict["poses"]
     reindex_map = 3 + torch.cat(
-        [3 * SKILLMIMIC_INDEX_MAP[:, None] + i for i in range(3)], dim=1
+        [3 * GYM_TO_SMPL_IDX[:, None] + i for i in range(3)], dim=1
     ).flatten()
     poses[:, 3:(54 * 3)] = poses[:, reindex_map]
 
@@ -125,6 +130,33 @@ def convert_skillmimic_to_smplx(input_path, gender="neutral"):
 
     del data_dict["poses"]
     return data_dict
+
+def convert_intermimic_to_smplx(input_path, gender="neutral"):
+    hoi_2d = load_intermimic_hoi_2d(input_path)
+    parsed = parse_intermimic_hoi(hoi_2d)
+
+    root_orient = (
+        R.from_quat(parsed["root_rot_xyzw"])
+        * R.from_matrix(np.array([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32))
+    ).as_rotvec().astype(np.float32) # Reorder from InterMimic y-up to SMPL-X z-up convention
+    pose_body = build_intermimic_pose_body(parsed)
+    obj_rot = (
+        R.from_quat(parsed["obj_rot_xyzw"]) 
+        * R.from_matrix(np.array([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32))
+    ).as_rotvec().astype(np.float32)
+    obj_state = np.concatenate([parsed["obj_pos"], obj_rot], axis=1).astype(np.float32)
+
+    return {
+        "gender": np.array(gender),
+        "betas": np.zeros(16, dtype=np.float32),
+        "mocap_frame_rate": np.array(30.0, dtype=np.float32), # Fixed frame rate for InterMimic data since it's not explicitly provided
+        "trans": parsed["root_pos"].astype(np.float32),
+        "root_orient": root_orient,
+        "pose_body": pose_body,
+        "obj_state": obj_state,
+        "obj_contact": parsed["contact_obj"].astype(np.int32),
+        "contact_human": parsed["contact_human"].astype(np.int32),
+    }
 
 
 def load_gvhmr_pred_file(gvhmr_pred_file, smplx_body_model_path):

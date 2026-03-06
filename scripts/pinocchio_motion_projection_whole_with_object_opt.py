@@ -2,18 +2,26 @@ import os
 import time
 import argparse
 import pathlib
+import contextlib
 from typing import Optional
 
 import numpy as np
 import casadi as ca
 import pinocchio as pin
-import pinocchio.casadi as cpin
+import meshcat.transformations as tf
 import torch
 import pickle
 
-from general_motion_retargeting import GeneralMotionRetargeting as GMR
-from general_motion_retargeting import RobotMotionViewer, optimize_object_traj_from_motion
+from general_motion_retargeting import RobotMotionViewer
 from general_motion_retargeting.kinematics_model import KinematicsModel
+from general_motion_retargeting.object_model_utils import (
+    get_object_motion_defaults,
+    resolve_object_model_path,
+)
+from general_motion_retargeting.pinocchio_model import PinocchioCasadiRobot
+from general_motion_retargeting.projection_data_utils import (
+    build_projection_motion_data_with_gmr,
+)
 from general_motion_retargeting.params import ROBOT_XML_DICT
 from general_motion_retargeting.rot_utils import (
     rot_from_quat_wxyz,
@@ -24,14 +32,11 @@ from general_motion_retargeting.rot_utils import (
     pad_or_truncate,
     pad_or_truncate_1d,
 )
-from general_motion_retargeting.utils.smpl import (
-    get_smplx_data_offline_fast,
-    load_smplx_data,
-    convert_skillmimic_to_smplx,
-)
 
 
 URDF_PATH = "assets/unitree_g1/g1_29dof_w_hands.urdf"
+OBJECT_MODEL_PATH = "assets/objects/basketball.urdf"
+AUTO_OBJECT_FROM_PATH = True
 BASE_BODY_NAME = "pelvis"
 
 LINK_TRACKING_WEIGHTS_W = {
@@ -58,11 +63,6 @@ JOINT_TRACKING_WEIGHTS = {
     # set weights here if you want specific joint tracking
 }
 
-CONTACT_POINTS_O_LOCAL = {
-    # "left_rubber_hand": np.array([0.07, -0.11, 0.05]),
-    "right_rubber_hand": np.array([0.07, 0.11, 0.05]),
-}
-
 POSE_TRACKING_WEIGHT = 1.0
 LINK_POS_TRACKING_WEIGHT = 1.0
 LINK_B_ORIENT_TRACKING_WEIGHT = 1.0
@@ -73,207 +73,30 @@ VELOCITY_REG_WEIGHT = 5e-4
 
 BALL_RADIUS = 0.12
 MIN_BALL_HEIGHT = 0.13
-BALL_GRAVITY = np.array([0.0, 0.0, -9.81])
-BALL_SPEED_THRESH = 0.05
-BALL_CONTACT_WEIGHT = 500.0
-BALL_VEL_SMOOTH_W = 10.0
-BALL_GROUND_SMOOTH_W = 200.0
-BALL_GROUND_Z_MIN = 0.11
-BALL_GROUND_Z_MAX = 0.13
-BALL_GROUND_VZ_ABS = 0.05
-
-
-def build_motion_data_from_skillmimic(
-    input_path: str,
-    robot: str,
-    gender: str,
-    tgt_fps: int = 60,
-    device: Optional[str] = None,
-) -> dict:
-    smplx_folder = pathlib.Path(__file__).parent / ".." / "assets" / "body_models"
-    smplx_data = convert_skillmimic_to_smplx(input_path, gender)
-    body_model, smplx_output, actual_human_height, obj_data = load_smplx_data(
-        smplx_data, smplx_folder
-    )
-
-    smplx_frames, aligned_fps, object_frames = get_smplx_data_offline_fast(
-        smplx_data, body_model, smplx_output, tgt_fps=tgt_fps, object_data=obj_data
-    )
-    if object_frames is None:
-        raise ValueError("SkillMimic file has no object data; cannot optimize ball.")
-
-    retarget = GMR(
-        actual_human_height=actual_human_height,
-        src_human="smplx",
-        tgt_robot=robot,
-    )
-
-    qpos_list = [retarget.retarget(frame) for frame in smplx_frames]
-
-    root_pos = np.array([qpos[:3] for qpos in qpos_list])
-    root_rot = np.array([qpos[3:7] for qpos in qpos_list])
-    dof_pos = np.array([qpos[7:] for qpos in qpos_list])
-
-    if device is None:
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-
-    kin = KinematicsModel(retarget.xml_file, device=device)
-    world_body_pos, world_body_orient = kin.forward_kinematics(
-        root_pos=torch.from_numpy(root_pos).to(device=device, dtype=torch.float32),
-        root_rot=torch.from_numpy(root_rot)[..., [1, 2, 3, 0]].to(device=device, dtype=torch.float32),
-        dof_pos=torch.from_numpy(dof_pos).to(device=device, dtype=torch.float32),
-    )
-    local_body_pos, local_body_orient = kin.forward_kinematics(
-        root_pos=torch.zeros(root_pos.shape).to(device=device, dtype=torch.float32),
-        root_rot=(
-            torch.zeros(root_rot.shape).to(device=device, dtype=torch.float32)
-            + torch.tensor([0.0, 0.0, 0.0, 1.0]).to(device=device, dtype=torch.float32)
-        ),
-        dof_pos=torch.from_numpy(dof_pos).to(device=device, dtype=torch.float32),
-    )
-
-    body_names = kin.body_names
-    world_body_orient = world_body_orient[..., [3, 0, 1, 2]].cpu().numpy()
-    world_body_pos = world_body_pos.cpu().numpy()
-    local_body_orient = local_body_orient[..., [3, 0, 1, 2]].cpu().numpy()
-    local_body_pos = local_body_pos.cpu().numpy()
-
-    obj_pos = np.array([object_frames[k][0] for k in range(len(object_frames))])
-    obj_rot = np.array([object_frames[k][1] for k in range(len(object_frames))])
-    obj_contact = np.array([object_frames[k][2] for k in range(len(object_frames))])
-    obj_ground_contact = (obj_pos[:, 2:] <= MIN_BALL_HEIGHT).astype(np.int8)
-
-    motion_data = {
-        "fps": aligned_fps,
-        "root_pos": root_pos,
-        "root_rot": root_rot,
-        "dof_pos": dof_pos,
-        "world_body_pos": world_body_pos,
-        "world_body_orient": world_body_orient,
-        "local_body_pos": local_body_pos,
-        "local_body_orient": local_body_orient,
-        "link_body_list": body_names,
-        "dof_names": retarget.robot_motor_names,
-        "object_pos": obj_pos,
-        "object_rot": obj_rot,
-        "contact_sequence": obj_contact,
-        "ground_contact_sequence": obj_ground_contact,
-    }
-
-    try:
-        optimized_obj_pos, optimized_obj_vel = optimize_object_traj_from_motion(
-            motion_data=motion_data,
-            contact_link_names=list(CONTACT_POINTS_O_LOCAL.keys()),
-            local_offsets=[CONTACT_POINTS_O_LOCAL[name] for name in CONTACT_POINTS_O_LOCAL.keys()],
-            speed_thresh=BALL_SPEED_THRESH,
-        )
-    except Exception as exc:
-        print(f"[WARN] Failed to retarget ball trajectory: {exc}")
-        return motion_data
-
-    motion_data = dict(motion_data)
-    motion_data["object_pos"] = optimized_obj_pos
-    motion_data["object_vel"] = optimized_obj_vel
-    return motion_data
-
-
-class PinocchioCasadiRobot:
-    def __init__(self, urdf_path, package_dirs=None):
-        if package_dirs is None:
-            package_dirs = [os.path.dirname(urdf_path)]
-
-        root_joint = pin.JointModelFreeFlyer()
-        self.model, self.collision_model, self.visual_model = pin.buildModelsFromUrdf(
-            urdf_path, package_dirs, root_joint
-        )
-        self.data = self.model.createData()
-        self.nq = self.model.nq
-        self.nv = self.model.nv
-
-        self.q_lower = self.model.lowerPositionLimit.copy()
-        self.q_upper = self.model.upperPositionLimit.copy()
-        self.v_abs = self.model.velocityLimit.copy()
-
-        self.joint_q_indices = []
-        self.joint_v_indices = []
-        for jid, joint in enumerate(self.model.joints):
-            if jid <= 1:
-                continue
-            if joint.nq == 1 and joint.nv == 1:
-                self.joint_q_indices.append(joint.idx_q)
-                self.joint_v_indices.append(joint.idx_v)
-        self.joint_q_indices = np.array(self.joint_q_indices, dtype=int)
-        self.joint_v_indices = np.array(self.joint_v_indices, dtype=int)
-
-        ff_joint = self.model.joints[1]
-        self.base_q_start = ff_joint.idx_q
-        self.base_q_size = ff_joint.nq
-
-        self.base_body_name = BASE_BODY_NAME
-        self.body_names = [f.name for f in self.model.frames]
-
-        self.dof_name_to_index = {}
-        for jid, joint in enumerate(self.model.joints):
-            name = self.model.names[jid]
-            if jid <= 1:
-                continue
-            if joint.nq == 1:
-                self.dof_name_to_index[name] = joint.idx_q
-
-        self.cmodel = cpin.Model(self.model)
-        q_sym = ca.SX.sym("q", self.cmodel.nq, 1)
-        data_sym = self.cmodel.createData()
-        cpin.forwardKinematics(self.cmodel, data_sym, q_sym)
-        cpin.updateFramePlacements(self.cmodel, data_sym)
-
-        self.fk_world_pos = {}
-        self.fk_world_rot = {}
-        self.fk_rel_pos = {}
-        self.fk_rel_rot = {}
-
-        base_frame_id = self.cmodel.getFrameId(self.base_body_name)
-        for frame_id in range(self.cmodel.nframes):
-            frame = self.cmodel.frames[frame_id]
-            name = frame.name
-            oMf = data_sym.oMf[frame_id]
-            p_WB = oMf.translation
-            R_WB = oMf.rotation
-            self.fk_world_pos[name] = ca.Function(f"fk_wp_{name}", [q_sym], [p_WB])
-            self.fk_world_rot[name] = ca.Function(f"fk_wr_{name}", [q_sym], [R_WB])
-
-            oMf_base = data_sym.oMf[base_frame_id]
-            base_to_body = oMf_base.inverse() * oMf
-            p_BB = base_to_body.translation
-            R_BB = base_to_body.rotation
-            self.fk_rel_pos[(self.base_body_name, name)] = ca.Function(
-                f"fk_bp_{name}", [q_sym], [p_BB]
-            )
-            self.fk_rel_rot[(self.base_body_name, name)] = ca.Function(
-                f"fk_br_{name}", [q_sym], [R_BB]
-            )
-
-        self.q0 = pin.neutral(self.model)
-
-    def world_pos(self, body_name, q):
-        return self.fk_world_pos[body_name](q)
-
-    def world_rotmat(self, body_name, q):
-        return self.fk_world_rot[body_name](q)
-
-    def rel_pos(self, base_name, body_name, q):
-        return self.fk_rel_pos[(base_name, body_name)](q)
-
-    def rel_rotmat(self, base_name, body_name, q):
-        return self.fk_rel_rot[(base_name, body_name)](q)
-
-    def compute_kinematics(self, q):
-        pin.forwardKinematics(self.model, self.data, q)
-        pin.updateFramePlacements(self.model, self.data)
+OBJECT_GRAVITY = np.array([0.0, 0.0, -9.81])
+OBJECT_SPEED_THRESH = 0.05
+OBJECT_CONTACT_WEIGHT = 500.0
+OBJECT_VEL_SMOOTH_W = 10.0
+OBJECT_GROUND_SMOOTH_W = 200.0
+OBJECT_GROUND_Z_MIN = 0.11
+OBJECT_GROUND_Z_MAX = 0.13
+OBJECT_GROUND_VZ_ABS = 0.05
 
 
 class PinocchioContactProjector:
-    def __init__(self, urdf_path):
-        self.robot = PinocchioCasadiRobot(urdf_path)
+    def __init__(
+        self,
+        urdf_path,
+        object_model_path,
+        object_height,
+        contact_points_o_local=None,
+    ):
+        self.robot = PinocchioCasadiRobot(
+            urdf_path,
+            object_model_path=object_model_path,
+            base_body_name=BASE_BODY_NAME,
+            object_radius=BALL_RADIUS,
+        )
         self.base_body_name = BASE_BODY_NAME
 
     def project_motion(self, motion_data: dict) -> dict:
@@ -327,7 +150,7 @@ class PinocchioContactProjector:
         ground_contact_flags = (ground_contact_seq != 0)
         v_ref = finite_difference_velocities(obj_pos, dt)
         speed_ref = np.linalg.norm(v_ref, axis=1)
-        g_vec_dm = ca.DM(BALL_GRAVITY)
+        g_vec_dm = ca.DM(OBJECT_GRAVITY)
         zero3 = ca.DM.zeros(3, 1)
 
         contact_offsets_dm = {
@@ -338,8 +161,8 @@ class PinocchioContactProjector:
         opti = ca.Opti()
         q_traj = opti.variable(N, nq)
         v_traj = opti.variable(N, nv)
-        ball_pos = opti.variable(N, 3)
-        ball_vel = opti.variable(N, 3)
+        object_pos = opti.variable(N, 3)
+        object_vel = opti.variable(N, 3)
 
         total_cost = 0
         base_pos_idx = self.robot.base_q_start
@@ -429,8 +252,8 @@ class PinocchioContactProjector:
                         R_BB - ca.DM(R_local_ref[t, idx])
                     )
 
-            p_ball_t = ball_pos[t, :].T
-            v_ball_t = ball_vel[t, :].T
+            p_object_t = object_pos[t, :].T
+            v_object_t = object_vel[t, :].T
 
             if body_contact_flags[t]:
                 for name, p_BC_DM in contact_offsets_dm.items():
@@ -440,19 +263,19 @@ class PinocchioContactProjector:
                     R_WB = self.robot.world_rotmat(name, q_t)
                     p_WC_des = p_WB + R_WB @ p_BC_DM
                     # Cost: keep ball at contact point during contact frames.
-                    total_cost += BALL_CONTACT_WEIGHT * ca.sumsqr(p_ball_t - p_WC_des)
+                    total_cost += OBJECT_CONTACT_WEIGHT * ca.sumsqr(p_object_t - p_WC_des)
 
             if ground_contact_flags[t]:
-                opti.subject_to(p_ball_t[2] <= BALL_GROUND_Z_MAX)
-                opti.subject_to(p_ball_t[2] >= BALL_GROUND_Z_MIN)
-                opti.subject_to(v_ball_t[2] <= BALL_GROUND_VZ_ABS)
-                opti.subject_to(v_ball_t[2] >= -BALL_GROUND_VZ_ABS)
+                opti.subject_to(p_object_t[2] <= OBJECT_GROUND_Z_MAX)
+                opti.subject_to(p_object_t[2] >= OBJECT_GROUND_Z_MIN)
+                opti.subject_to(v_object_t[2] <= OBJECT_GROUND_VZ_ABS)
+                opti.subject_to(v_object_t[2] >= -OBJECT_GROUND_VZ_ABS)
 
         for k in range(N - 1):
-            p_k = ball_pos[k, :].T
-            v_k = ball_vel[k, :].T
-            p_next = ball_pos[k + 1, :].T
-            v_next = ball_vel[k + 1, :].T
+            p_k = object_pos[k, :].T
+            v_k = object_vel[k, :].T
+            p_next = object_pos[k + 1, :].T
+            v_next = object_vel[k + 1, :].T
 
             opti.subject_to(p_next == p_k + dt * v_k)
 
@@ -464,13 +287,13 @@ class PinocchioContactProjector:
             else:
                 dv_z = v_next[2] - v_k[2]
                 # Cost: smooth vertical velocity while in contact.
-                total_cost += BALL_VEL_SMOOTH_W * ca.sumsqr(dv_z)
+                total_cost += OBJECT_VEL_SMOOTH_W * ca.sumsqr(dv_z)
 
             dv_xy = v_next[0:2] - v_k[0:2]
             # Cost: smooth horizontal velocity changes.
-            total_cost += BALL_GROUND_SMOOTH_W * ca.sumsqr(dv_xy)
+            total_cost += OBJECT_GROUND_SMOOTH_W * ca.sumsqr(dv_xy)
 
-            if speed_ref[k] > BALL_SPEED_THRESH:
+            if speed_ref[k] > OBJECT_SPEED_THRESH:
                 v_ref_k = ca.DM(v_ref[k])
                 denom = (ca.norm_2(v_k) * ca.norm_2(v_ref_k) + 1e-8)
                 cos_sim = (v_k.T @ v_ref_k) / denom
@@ -479,8 +302,8 @@ class PinocchioContactProjector:
             else:
                 opti.subject_to(v_k == zero3)
 
-        v_last = ball_vel[N - 1, :].T
-        if speed_ref[N - 1] > BALL_SPEED_THRESH:
+        v_last = object_vel[N - 1, :].T
+        if speed_ref[N - 1] > OBJECT_SPEED_THRESH:
             v_ref_last = ca.DM(v_ref[N - 1])
             denom_last = (ca.norm_2(v_last) * ca.norm_2(v_ref_last) + 1e-8)
             cos_sim_last = (v_last.T @ v_ref_last) / denom_last
@@ -531,14 +354,14 @@ class PinocchioContactProjector:
 
         opti.set_initial(q_traj, q_init)
         opti.set_initial(v_traj, v_init)
-        ball_vel_init = motion_data.get("object_vel")
-        if ball_vel_init is not None:
-            ball_vel_init = pad_or_truncate(ball_vel_init, N)
+        object_vel_init = motion_data.get("object_vel")
+        if object_vel_init is not None:
+            object_vel_init = pad_or_truncate(object_vel_init, N)
         else:
-            ball_vel_init = v_ref
+            object_vel_init = v_ref
 
-        opti.set_initial(ball_pos, obj_pos)
-        opti.set_initial(ball_vel, ball_vel_init)
+        opti.set_initial(object_pos, obj_pos)
+        opti.set_initial(object_vel, object_vel_init)
 
         opti.solver("ipopt", {"ipopt.print_level": 0, "print_time": False})
 
@@ -553,8 +376,8 @@ class PinocchioContactProjector:
         print(f"[INFO] Solver time: {time.time() - t0:.2f} s")
 
         q_sol = sol.value(q_traj)
-        ball_pos_sol = sol.value(ball_pos)
-        ball_vel_sol = sol.value(ball_vel)
+        object_pos_sol = sol.value(object_pos)
+        object_vel_sol = sol.value(object_vel)
 
         new_dof_pos = np.zeros_like(dof_pos)
         new_world_body_pos = np.zeros_like(ref_world_body_pos)
@@ -606,6 +429,21 @@ class PinocchioContactProjector:
                     [quat_BB.w, quat_BB.x, quat_BB.y, quat_BB.z]
                 )
 
+        # --------- Visualization of the optimized trajectory ----------
+        print("[INFO] Visualizing optimized trajectory in Meshcat...")
+        for t in range(N):
+            self.robot.viz.display(q_sol[t, :])
+
+            # Ball transform (you use [w,x,y,z] -> Meshcat wants [x,y,z,w])
+            w, x, y, z = obj_rot[t]
+            T = tf.quaternion_matrix([x, y, z, w])
+            T[0:3, 3] = object_pos_sol[t]
+            self.robot.viz.viewer[self.robot.ball_path].set_transform(T)
+
+            if t % 2 == 0:
+                time.sleep(0.02)
+
+
         new_motion_data = dict(motion_data)
         new_motion_data.update(
             {
@@ -617,8 +455,8 @@ class PinocchioContactProjector:
                 "world_body_orient": new_world_body_orient,
                 "local_body_pos": new_local_body_pos,
                 "local_body_orient": new_local_body_orient,
-                "object_pos": ball_pos_sol,
-                "object_vel": ball_vel_sol,
+                "object_pos": object_pos_sol,
+                "object_vel": object_vel_sol,
                 "object_rot": obj_rot,
                 "contact_sequence": contact_seq.reshape(-1, 1),
                 "ground_contact_sequence": ground_contact_seq.reshape(-1, 1),
@@ -628,7 +466,12 @@ class PinocchioContactProjector:
         return new_motion_data
 
 
-def record_motion_video(motion_data: dict, robot: str, video_path: str):
+def record_motion_video(
+    motion_data: dict,
+    robot: str,
+    video_path: str,
+    object_model_path: Optional[str] = None,
+):
     fps = float(motion_data["fps"])
     root_pos = np.asarray(motion_data["root_pos"])
     root_rot = np.asarray(motion_data["root_rot"])
@@ -654,6 +497,7 @@ def record_motion_video(motion_data: dict, robot: str, video_path: str):
         motion_fps=fps,
         record_video=True,
         video_path=video_path,
+        object_model_path=object_model_path,
     )
     try:
         for t in range(root_pos.shape[0]):
@@ -681,24 +525,34 @@ def record_motion_video(motion_data: dict, robot: str, video_path: str):
         viewer.close()
 
 
-def process_skillmimic_file(
+def process_file(
     projector: PinocchioContactProjector,
     in_path: str,
     out_path: str,
     robot: str,
     gender: str,
     tgt_fps: int,
-    device: Optional[str],
+    device: str,
     record_video: bool,
+    object_model_path: Optional[str] = None,
 ):
-    motion_data = build_motion_data_from_skillmimic(
-        input_path=in_path,
-        robot=robot,
-        gender=gender,
-        tgt_fps=tgt_fps,
-        device=device,
-    )
+    with open(os.devnull, "w") as _null, contextlib.redirect_stdout(_null), contextlib.redirect_stderr(_null):
+        motion_data, source_tag = build_projection_motion_data_with_gmr(
+            input_path=in_path,
+            robot=robot,
+            gender=gender,
+            tgt_fps=tgt_fps,
+            device=device,
+            min_object_height=projector.object_height,
+            contact_points_o_local=projector.contact_points_o_local,
+            object_speed_thresh=OBJECT_SPEED_THRESH,
+        )
+    print(f"[INFO] Loaded motion source '{source_tag}' from '{in_path}'.")
     fixed_motion = projector.project_motion(motion_data)
+    # fixed_motion = motion_data
+    if object_model_path is not None:
+        fixed_motion = dict(fixed_motion)
+        fixed_motion["object_model_path"] = object_model_path
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "wb") as f:
         pickle.dump(fixed_motion, f)
@@ -711,31 +565,53 @@ def process_skillmimic_file(
             motion_folder = out_stem
         in_stem = os.path.splitext(os.path.basename(in_path))[0]
         record_video_path = f"videos/{motion_folder}/{robot}_{in_stem}.mp4"
-        record_motion_video(fixed_motion, robot, record_video_path)
+        record_motion_video(
+            fixed_motion,
+            robot,
+            record_video_path,
+            object_model_path=object_model_path or fixed_motion.get("object_model_path"),
+        )
     return out_path
 
 
-def process_skillmimic_folder(
-    projector: PinocchioContactProjector,
+def process_folder(
+    projector_cache: dict,
     src_folder: str,
     tgt_folder: str,
     robot: str,
     gender: str,
     tgt_fps: int,
-    device: Optional[str],
+    device: str,
     record_video: bool,
+    urdf_path: str,
+    default_object_model_path: str,
 ):
     for root, _, files in os.walk(src_folder):
         rel_root = os.path.relpath(root, src_folder)
         out_root = os.path.join(tgt_folder, rel_root)
         for fname in sorted(files):
-            if not fname.endswith(".pt"):
+            if not (fname.endswith(".pt") or fname.endswith(".pkl")):
                 continue
             in_path = os.path.join(root, fname)
             stem, _ = os.path.splitext(fname)
             out_path = os.path.join(out_root, stem + "_projected.pkl")
             print(f"[INFO] Processing: {in_path}")
-            process_skillmimic_file(
+
+            object_model_path = resolve_object_model_path(
+                motion_path=in_path,
+                configured_object_model_path=default_object_model_path,
+                auto_from_motion_path=AUTO_OBJECT_FROM_PATH,
+                default_object_model_path=default_object_model_path,
+            )
+            if object_model_path not in projector_cache:
+                print(f"[INFO] Using object model: {object_model_path}")
+                projector_cache[object_model_path] = PinocchioContactProjector(
+                    urdf_path=urdf_path,
+                    object_model_path=object_model_path,
+                )
+            projector = projector_cache[object_model_path]
+
+            process_file(
                 projector=projector,
                 in_path=in_path,
                 out_path=out_path,
@@ -744,16 +620,17 @@ def process_skillmimic_folder(
                 tgt_fps=tgt_fps,
                 device=device,
                 record_video=record_video,
+                object_model_path=object_model_path,
             )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Retarget SkillMimic -> robot and run joint robot+ball optimization."
+        description="Retarget SMPL motion data with GMR and run joint robot+object optimization."
     )
-    parser.add_argument("--src_folder", type=str, default="data/skillmimic/run", help="Source directory of SkillMimic .pt files")
+    parser.add_argument("--src_folder", type=str, default="data/skillmimic/run", help="Source directory of SMPL motion files")
     parser.add_argument("--tgt_folder", type=str, default="data/g1_skillmimic/run/projected_with_object", help="Target directory for projected .pkl files")
-    parser.add_argument("--input_file", type=str, help="Single input SkillMimic .pt file")
+    parser.add_argument("--input_file", type=str, help="Single input SMPL motion file")
     parser.add_argument("--save_path", type=str, help="Single output .pkl file")
     parser.add_argument("--tgt_fps", type=int, default=60, help="Target FPS for retargeting")
     parser.add_argument("--gender", type=str, default="neutral", choices=["male", "female", "neutral"])
@@ -768,35 +645,57 @@ if __name__ == "__main__":
         ],
         default="unitree_g1",
     )
-    parser.add_argument("--device", type=str, default=None, help="Torch device for kinematics")
     parser.add_argument("--record_video", action="store_true", default=True, help="Record a MuJoCo video for each output")
     parser.add_argument("--urdf_path", type=str, default=URDF_PATH, help="Robot URDF path")
+    parser.add_argument(
+        "--object_model_path",
+        type=str,
+        default=OBJECT_MODEL_PATH,
+        help="Optional external object visual model (.urdf/.xml/.obj/.stl/.dae).",
+    )
     args = parser.parse_args()
 
-    projector = PinocchioContactProjector(urdf_path=args.urdf_path)
+    projector_cache = {}
 
     if args.src_folder and args.tgt_folder:
-        process_skillmimic_folder(
-            projector=projector,
+        process_folder(
+            projector_cache=projector_cache,
             src_folder=args.src_folder,
             tgt_folder=args.tgt_folder,
             robot=args.robot,
             gender=args.gender,
             tgt_fps=args.tgt_fps,
-            device=args.device,
+            device="cuda" if torch.cuda.is_available() else "cpu",
             record_video=args.record_video,
+            urdf_path=args.urdf_path,
+            default_object_model_path=args.object_model_path,
         )
     elif args.input_file:
+        object_model_path = resolve_object_model_path(
+            motion_path=args.input_file,
+            configured_object_model_path=args.object_model_path,
+            auto_from_motion_path=AUTO_OBJECT_FROM_PATH,
+            default_object_model_path=args.object_model_path,
+        )
+        if object_model_path not in projector_cache:
+            print(f"[INFO] Using object model: {object_model_path}")
+            projector_cache[object_model_path] = PinocchioContactProjector(
+                urdf_path=args.urdf_path,
+                object_model_path=object_model_path,
+            )
+        projector = projector_cache[object_model_path]
+
         save_path = args.save_path or (os.path.splitext(args.input_file)[0] + "_projected.pkl")
-        process_skillmimic_file(
+        process_file(
             projector=projector,
             in_path=args.input_file,
             out_path=save_path,
             robot=args.robot,
             gender=args.gender,
             tgt_fps=args.tgt_fps,
-            device=args.device,
+            device="cuda" if torch.cuda.is_available() else "cpu",
             record_video=args.record_video,
+            object_model_path=object_model_path,
         )
     else:
         parser.print_help()
