@@ -121,6 +121,9 @@ def _extract_source_data(
         -1, 1
     )
 
+    # Offset object trajectory to smpl root frame
+    object_pos += (smplx_frames[-1]['pelvis'][0] - smplx_output.transl[-1].numpy()).astype(np.float32)
+
     return (
         {
             "smplx_frames": smplx_frames,
