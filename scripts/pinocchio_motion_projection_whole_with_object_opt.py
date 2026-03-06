@@ -78,8 +78,6 @@ OBJECT_SPEED_THRESH = 0.05
 OBJECT_CONTACT_WEIGHT = 500.0
 OBJECT_VEL_SMOOTH_W = 10.0
 OBJECT_GROUND_SMOOTH_W = 200.0
-OBJECT_GROUND_Z_MIN = 0.11
-OBJECT_GROUND_Z_MAX = 0.13
 OBJECT_GROUND_VZ_ABS = 0.05
 
 
@@ -88,7 +86,7 @@ class PinocchioContactProjector:
         self,
         urdf_path,
         object_model_path,
-        object_height,
+        min_object_height,
         contact_points_o_local=None,
     ):
         self.robot = PinocchioCasadiRobot(
@@ -119,7 +117,7 @@ class PinocchioContactProjector:
         ground_contact_seq = np.asarray(
             motion_data.get(
                 "ground_contact_sequence",
-                (obj_pos[:, 2:] <= MIN_BALL_HEIGHT).astype(np.int8),
+                (obj_pos[:, 2:] <= self.min_object_height).astype(np.int8),
             )
         ).reshape(-1)
 
@@ -266,8 +264,8 @@ class PinocchioContactProjector:
                     total_cost += OBJECT_CONTACT_WEIGHT * ca.sumsqr(p_object_t - p_WC_des)
 
             if ground_contact_flags[t]:
-                opti.subject_to(p_object_t[2] <= OBJECT_GROUND_Z_MAX)
-                opti.subject_to(p_object_t[2] >= OBJECT_GROUND_Z_MIN)
+                opti.subject_to(p_object_t[2] <= (obj_pos[t, 2] + 0.01))
+                opti.subject_to(p_object_t[2] >= (obj_pos[t, 2] - 0.01))
                 opti.subject_to(v_object_t[2] <= OBJECT_GROUND_VZ_ABS)
                 opti.subject_to(v_object_t[2] >= -OBJECT_GROUND_VZ_ABS)
 

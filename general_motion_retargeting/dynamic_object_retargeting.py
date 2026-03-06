@@ -149,8 +149,8 @@ def build_and_solve_ball_optimization(
             # GROUND contact:
             p_z = p_k[2]
             v_z = v_k[2]
-            ineq_constraints.append(p_z - 0.13)
-            ineq_constraints.append(-p_z + 0.11)
+            ineq_constraints.append(p_z - (p_ref[k, 2]+0.01))
+            ineq_constraints.append(-p_z + (p_ref[k, 2]-0.01))
             ineq_constraints.append(v_z - 0.05)
             ineq_constraints.append(-v_z - 0.05)
 
