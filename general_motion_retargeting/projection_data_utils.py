@@ -151,6 +151,7 @@ def _build_motion_data_from_source_frames(
     robot: str,
     actual_human_height: Optional[float],
     device: Optional[str],
+    anchor_links_smplx: list[str],
     contact_links: list[str],
     object_speed_thresh: float,
 ) -> Dict[str, Any]:
@@ -162,10 +163,15 @@ def _build_motion_data_from_source_frames(
     object_rot_wxyz = pad_or_truncate(np.asarray(object_rot_wxyz, dtype=np.float32), T)
     object_contact = pad_or_truncate(np.asarray(object_contact, dtype=np.float32).reshape(-1, 1), T)
     m = (object_contact > 0.5).astype(np.float32)
-    left_hand_pos_world = np.asarray([f["left_index3"][0] for f in smplx_frames], dtype=np.float32)
-    right_hand_pos_world = np.asarray([f["right_index3"][0] for f in smplx_frames], dtype=np.float32)
-    left_hand_rot_wxyz = np.asarray([f["left_index3"][1] for f in smplx_frames], dtype=np.float32)
-    right_hand_rot_wxyz = np.asarray([f["right_index3"][1] for f in smplx_frames], dtype=np.float32)
+    anchor_links_smplx = list(anchor_links_smplx)
+    if len(anchor_links_smplx) == 2:
+        left_anchor_link, right_anchor_link = anchor_links_smplx[0], anchor_links_smplx[1]
+    else:
+        raise ValueError("anchor_links_smplx must contain exactly two link names.")
+    left_hand_pos_world = np.asarray([f[left_anchor_link][0] for f in smplx_frames], dtype=np.float32)
+    right_hand_pos_world = np.asarray([f[right_anchor_link][0] for f in smplx_frames], dtype=np.float32)
+    left_hand_rot_wxyz = np.asarray([f[left_anchor_link][1] for f in smplx_frames], dtype=np.float32)
+    right_hand_rot_wxyz = np.asarray([f[right_anchor_link][1] for f in smplx_frames], dtype=np.float32)
     object_pos_in_left_hand_frame = R.from_quat(left_hand_rot_wxyz[:, [1, 2, 3, 0]]).inv().apply(object_pos - left_hand_pos_world)[:, [1, 0, 2]]
     object_pos_in_right_hand_frame = R.from_quat(right_hand_rot_wxyz[:, [1, 2, 3, 0]]).inv().apply(object_pos - right_hand_pos_world)[:, [1, 0, 2]]
 
@@ -277,6 +283,7 @@ def build_projection_motion_data_with_gmr(
     tgt_fps: int = 60,
     device: str,
     min_object_height: float,
+    anchor_links_smplx: Optional[list[str]],
     contact_links: Optional[list[str]],
     object_speed_thresh: float,
 ) -> Tuple[Dict[str, Any], str]:
@@ -298,6 +305,7 @@ def build_projection_motion_data_with_gmr(
         robot=robot,
         actual_human_height=source_data["actual_human_height"],
         device=device,
+        anchor_links_smplx=anchor_links_smplx or [],
         contact_links=contact_links or [],
         object_speed_thresh=object_speed_thresh,
     )

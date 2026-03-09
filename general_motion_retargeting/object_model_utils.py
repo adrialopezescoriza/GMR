@@ -8,6 +8,7 @@ DEFAULT_OBJECT_MODEL_PATH = "assets/objects/basketball.urdf"
 OBJECT_MOTION_DEFAULTS = {
     "basketball": {
         "min_object_height": 0.13,
+        "anchor_links_smplx": ["left_index3", "right_index3"],
         "contact_links": [
             "left_hand_middle_0_link",
             "right_hand_middle_0_link",
@@ -15,6 +16,7 @@ OBJECT_MOTION_DEFAULTS = {
     },
     "largebox": {
         "min_object_height": 0.5,
+        "anchor_links_smplx": ["left_index3", "right_index3"],
         "contact_links": [
             "left_hand_middle_0_link",
             "right_hand_middle_0_link",
@@ -105,5 +107,6 @@ def get_object_motion_defaults(object_model_path: str) -> dict:
     cfg = OBJECT_MOTION_DEFAULTS.get(model_name, OBJECT_MOTION_DEFAULTS["basketball"])
     return {
         "min_object_height": float(cfg["min_object_height"]),
+        "anchor_links_smplx": list(cfg["anchor_links_smplx"]),
         "contact_links": list(cfg["contact_links"]),
     }

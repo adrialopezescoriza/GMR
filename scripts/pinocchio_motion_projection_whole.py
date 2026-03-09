@@ -86,6 +86,7 @@ class PinocchioContactProjector:
         urdf_path,
         object_model_path,
         min_object_height,
+        anchor_links_smplx=None,
         contact_links=None,
     ):
         self.robot = PinocchioCasadiRobot(
@@ -96,6 +97,7 @@ class PinocchioContactProjector:
         )
         self.base_body_name = BASE_BODY_NAME
         self.min_object_height = float(min_object_height)
+        self.anchor_links_smplx = anchor_links_smplx or []
         self.contact_links = contact_links or []
 
     def project_motion(self, motion_data: dict) -> dict:
@@ -551,6 +553,7 @@ def process_file(
             tgt_fps=tgt_fps,
             device=device,
             min_object_height=projector.min_object_height,
+            anchor_links_smplx=projector.anchor_links_smplx,
             contact_links=projector.contact_links,
             object_speed_thresh=OBJECT_SPEED_THRESH,
         )
@@ -617,6 +620,7 @@ def process_folder(
                     urdf_path=urdf_path,
                     object_model_path=object_model_path,
                     min_object_height=object_defaults["min_object_height"],
+                    anchor_links_smplx=object_defaults["anchor_links_smplx"],
                     contact_links=object_defaults["contact_links"],
                 )
             projector = projector_cache[object_model_path]
@@ -694,6 +698,7 @@ if __name__ == "__main__":
                 urdf_path=args.urdf_path,
                 object_model_path=object_model_path,
                 min_object_height=object_defaults["min_object_height"],
+                anchor_links_smplx=object_defaults["anchor_links_smplx"],
                 contact_links=object_defaults["contact_links"],
             )
         projector = projector_cache[object_model_path]
