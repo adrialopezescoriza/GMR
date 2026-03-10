@@ -104,13 +104,13 @@ def build_and_solve_ball_optimization(
         speed_ref_k = np.linalg.norm(v_ref_k_np)
 
         if speed_ref_k > speed_thresh:
-            # ball is moving: use cosine-difference cost
+            # object is moving: use cosine-difference cost
             v_ref_k = ca.DM(v_ref_k_np)
             denom = (ca.norm_2(v_k) * ca.norm_2(v_ref_k) + 1e-8)
             cos_sim = (v_k.T @ v_ref_k) / denom
             J = J + (1.0 - cos_sim)
         else:
-            # ball is effectively static: no cost, enforce v_k = 0
+            # object is effectively static: no cost, enforce v_k = 0
             eq_constraints.append(v_k)
 
     # ---- last step: same logic on v_T-1 ----

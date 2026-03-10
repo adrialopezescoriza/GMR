@@ -142,7 +142,6 @@ def convert_intermimic_to_smplx(input_path, gender="neutral"):
     pose_body = build_intermimic_pose_body(parsed)
     obj_rot = (
         R.from_quat(parsed["obj_rot_xyzw"]) 
-        * R.from_matrix(np.array([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32))
     ).as_rotvec().astype(np.float32)
     obj_state = np.concatenate([parsed["obj_pos"], obj_rot], axis=1).astype(np.float32)
 

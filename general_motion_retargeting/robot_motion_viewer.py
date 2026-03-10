@@ -1,5 +1,8 @@
 import os
 import time
+import tempfile
+import atexit
+import signal
 import xml.etree.ElementTree as ET
 import mujoco as mj
 import mujoco.viewer as mjv
@@ -9,6 +12,40 @@ from general_motion_retargeting import ROBOT_XML_DICT, ROBOT_BASE_DICT, VIEWER_C
 from loop_rate_limiters import RateLimiter
 import numpy as np
 from rich import print
+
+_RUNTIME_XML_PATHS = set()
+_CLEANUP_HOOKS_INSTALLED = False
+
+
+def _cleanup_runtime_xml_paths():
+    for p in list(_RUNTIME_XML_PATHS):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+        _RUNTIME_XML_PATHS.discard(p)
+
+
+def _install_runtime_xml_cleanup_hooks():
+    global _CLEANUP_HOOKS_INSTALLED
+    if _CLEANUP_HOOKS_INSTALLED:
+        return
+    _CLEANUP_HOOKS_INSTALLED = True
+    atexit.register(_cleanup_runtime_xml_paths)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        prev = signal.getsignal(sig)
+
+        def _handler(signum, frame, _prev=prev):
+            _cleanup_runtime_xml_paths()
+            if callable(_prev):
+                _prev(signum, frame)
+            elif _prev == signal.SIG_DFL:
+                raise SystemExit(128 + signum)
+            # SIG_IGN: intentionally do nothing after cleanup.
+
+        signal.signal(sig, _handler)
+
 
 def _parse_float_list(raw, n, default):
     if raw is None:
@@ -22,7 +59,7 @@ def _parse_float_list(raw, n, default):
 
 def _resolve_mesh_path(model_path, mesh_ref):
     if mesh_ref is None:
-        return None
+        raise ValueError(f"Missing mesh filename in URDF visual geometry: {model_path}")
     if os.path.isabs(mesh_ref) and os.path.isfile(mesh_ref):
         return mesh_ref
 
@@ -38,158 +75,128 @@ def _resolve_mesh_path(model_path, mesh_ref):
         c = os.path.normpath(c)
         if os.path.isfile(c):
             return c
-    return None
+    raise FileNotFoundError(f"Cannot resolve mesh path '{mesh_ref}' from '{model_path}'")
 
 
-def _mesh_half_extents_from_obj(mesh_path, scale=None):
-    if mesh_path is None:
-        return None
-    ext = os.path.splitext(mesh_path)[1].lower()
-    if ext != ".obj":
-        return None
-    verts = []
-    try:
-        with open(mesh_path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if not line.startswith("v "):
-                    continue
-                parts = line.strip().split()
-                if len(parts) < 4:
-                    continue
-                verts.append([float(parts[1]), float(parts[2]), float(parts[3])])
-    except Exception:
-        return None
-
-    if not verts:
-        return None
-    v = np.asarray(verts, dtype=float)
-    if scale is not None:
-        v = v * np.asarray(scale, dtype=float).reshape(1, 3)
-    vmin = v.min(axis=0)
-    vmax = v.max(axis=0)
-    half = 0.5 * (vmax - vmin)
-    if np.any(half <= 1e-6):
-        return None
-    return half
+def _rpy_to_quat_wxyz(rpy_xyz):
+    quat_xyzw = R.from_euler("xyz", rpy_xyz).as_quat()
+    return np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]], dtype=float)
 
 
-def _load_object_draw_spec(object_model_path):
-    default_spec = {"kind": "sphere", "size": np.array([0.12, 0.0, 0.0]), "name": "ball"}
+def _inject_urdf_object_into_robot_xml(robot_xml_path, object_model_path):
+    """
+    Merge a URDF visual object into a temporary robot MJCF as a mocap body.
+    Returns (temp_xml_path, object_body_name).
+    """
     if object_model_path is None:
-        return default_spec
+        raise ValueError("object_model_path is required and must point to a URDF file.")
+    object_path = os.path.abspath(object_model_path)
+    if not os.path.isfile(object_path):
+        raise FileNotFoundError(f"Object URDF not found: {object_path}")
+    if not object_path.lower().endswith(".urdf"):
+        raise ValueError(f"Object model must be a URDF file, got: {object_path}")
 
-    path = os.path.abspath(object_model_path)
-    if not os.path.isfile(path):
-        return default_spec
+    robot_tree = ET.parse(robot_xml_path)
+    robot_root = robot_tree.getroot()
 
-    ext = os.path.splitext(path)[1].lower()
-    name = os.path.splitext(os.path.basename(path))[0]
+    obj_root = ET.parse(object_path).getroot()
+    visual = obj_root.find(".//link/visual")
+    if visual is None:
+        raise ValueError(f"No <visual> found in URDF: {object_path}")
+    geom = visual.find("geometry")
+    if geom is None:
+        raise ValueError(f"No <geometry> under <visual> in URDF: {object_path}")
 
-    try:
-        root = ET.parse(path).getroot()
-        if ext == ".urdf":
-            visual = root.find(".//link/visual")
-            if visual is None:
-                return default_spec
-            geom = visual.find("geometry")
-            if geom is None:
-                return default_spec
-            sphere = geom.find("sphere")
-            box = geom.find("box")
-            cylinder = geom.find("cylinder")
-            mesh = geom.find("mesh")
-            if sphere is not None:
-                r = float(sphere.attrib.get("radius", "0.12"))
-                return {"kind": "sphere", "size": np.array([r, 0.0, 0.0]), "name": name}
-            if box is not None:
-                full = np.asarray(_parse_float_list(box.attrib.get("size"), 3, [0.24, 0.24, 0.24]), dtype=float)
-                return {"kind": "box", "size": 0.5 * full, "name": name}
-            if cylinder is not None:
-                radius = float(cylinder.attrib.get("radius", "0.12"))
-                length = float(cylinder.attrib.get("length", "0.24"))
-                return {"kind": "cylinder", "size": np.array([radius, 0.5 * length, 0.0]), "name": name}
-            if mesh is not None:
-                mesh_ref = mesh.attrib.get("filename") or mesh.attrib.get("file")
-                mesh_scale = _parse_float_list(mesh.attrib.get("scale"), 3, [1.0, 1.0, 1.0])
-                mesh_path = _resolve_mesh_path(path, mesh_ref)
-                half = _mesh_half_extents_from_obj(mesh_path, mesh_scale)
-                if half is not None:
-                    return {"kind": "box", "size": half, "name": name}
-            return default_spec
+    origin = visual.find("origin")
+    xyz = _parse_float_list(None if origin is None else origin.attrib.get("xyz"), 3, [0.0, 0.0, 0.0])
+    rpy = _parse_float_list(None if origin is None else origin.attrib.get("rpy"), 3, [0.0, 0.0, 0.0])
+    quat_wxyz = _rpy_to_quat_wxyz(rpy)
+    pos_str = f"{xyz[0]} {xyz[1]} {xyz[2]}"
+    quat_str = f"{quat_wxyz[0]} {quat_wxyz[1]} {quat_wxyz[2]} {quat_wxyz[3]}"
 
-        if ext == ".xml":
-            geom = root.find(".//worldbody//geom")
-            if geom is None:
-                geom = root.find(".//geom")
-            if geom is None:
-                return default_spec
-            gtype = geom.attrib.get("type", "sphere").lower()
-            size = np.asarray(_parse_float_list(geom.attrib.get("size"), 3, [0.12, 0.12, 0.12]), dtype=float)
-            if gtype == "sphere":
-                return {"kind": "sphere", "size": np.array([size[0], 0.0, 0.0]), "name": name}
-            if gtype == "box":
-                return {"kind": "box", "size": np.array([size[0], size[1], size[2]]), "name": name}
-            if gtype in ("cylinder", "capsule"):
-                half_len = size[1] if size.shape[0] > 1 else size[0]
-                return {"kind": gtype, "size": np.array([size[0], half_len, 0.0]), "name": name}
-            if gtype == "mesh":
-                mesh_name = geom.attrib.get("mesh")
-                mesh_ref = None
-                for mesh in root.findall(".//asset/mesh"):
-                    if mesh.attrib.get("name") == mesh_name:
-                        mesh_ref = mesh.attrib.get("file")
-                        mesh_scale = _parse_float_list(mesh.attrib.get("scale"), 3, [1.0, 1.0, 1.0])
-                        mesh_path = _resolve_mesh_path(path, mesh_ref)
-                        half = _mesh_half_extents_from_obj(mesh_path, mesh_scale)
-                        if half is not None:
-                            return {"kind": "box", "size": half, "name": name}
-                        break
-            return default_spec
-    except Exception:
-        return default_spec
+    rgba = [0.8, 0.8, 0.8, 1.0]
+    material = visual.find("material")
+    if material is not None:
+        color = material.find("color")
+        if color is not None:
+            rgba = _parse_float_list(color.attrib.get("rgba"), 4, rgba)
+    rgba_str = f"{rgba[0]} {rgba[1]} {rgba[2]} {rgba[3]}"
 
-    return default_spec
+    asset = robot_root.find("asset")
+    if asset is None:
+        asset = ET.SubElement(robot_root, "asset")
+    worldbody = robot_root.find("worldbody")
+    if worldbody is None:
+        raise ValueError(f"No <worldbody> in robot XML: {robot_xml_path}")
 
+    object_tag = os.path.splitext(os.path.basename(object_path))[0]
+    object_body_name = f"runtime_object_{object_tag}"
+    object_mesh_name = f"runtime_object_mesh_{object_tag}"
 
-def _object_geom_params(spec, data):
-    """Return (gtype, size, pos, mat, rgba) for the kinematic object."""
-    if data is None:
-        return None
-    pos, quat_wxyz, contact = data
+    body = ET.SubElement(
+        worldbody,
+        "body",
+        {
+            "name": object_body_name,
+            "mocap": "true",
+            "pos": "0 0 0",
+            "quat": "1 0 0 0",
+        },
+    )
 
-    kind = spec.get("kind", "sphere")
-    size = np.asarray(spec.get("size", np.array([0.12, 0.0, 0.0])), dtype=float)
-    if kind == "sphere":
-        gtype = mj.mjtGeom.mjGEOM_SPHERE
-        draw_size = np.array([size[0], 0.0, 0.0])
-    elif kind == "box":
-        gtype = mj.mjtGeom.mjGEOM_BOX
-        draw_size = np.array([size[0], size[1], size[2]])
-    elif kind == "cylinder":
-        gtype = mj.mjtGeom.mjGEOM_CYLINDER
-        draw_size = np.array([size[0], size[1], 0.0])
-    elif kind == "capsule":
-        gtype = mj.mjtGeom.mjGEOM_CAPSULE
-        draw_size = np.array([size[0], size[1], 0.0])
+    geom_attrs = {
+        "pos": pos_str,
+        "quat": quat_str,
+        "rgba": rgba_str,
+        "contype": "0",
+        "conaffinity": "0",
+        "group": "1",
+    }
+
+    sphere = geom.find("sphere")
+    box = geom.find("box")
+    cylinder = geom.find("cylinder")
+    mesh = geom.find("mesh")
+    if sphere is not None:
+        radius = float(sphere.attrib.get("radius", "0.12"))
+        geom_attrs.update({"type": "sphere", "size": f"{radius}"})
+    elif box is not None:
+        full = _parse_float_list(box.attrib.get("size"), 3, [0.24, 0.24, 0.24])
+        half = [0.5 * full[0], 0.5 * full[1], 0.5 * full[2]]
+        geom_attrs.update({"type": "box", "size": f"{half[0]} {half[1]} {half[2]}"})
+    elif cylinder is not None:
+        radius = float(cylinder.attrib.get("radius", "0.12"))
+        length = float(cylinder.attrib.get("length", "0.24"))
+        geom_attrs.update({"type": "cylinder", "size": f"{radius} {0.5 * length}"})
+    elif mesh is not None:
+        mesh_ref = mesh.attrib.get("filename") or mesh.attrib.get("file")
+        mesh_path = _resolve_mesh_path(object_path, mesh_ref)
+        mesh_scale = _parse_float_list(mesh.attrib.get("scale"), 3, [1.0, 1.0, 1.0])
+        ET.SubElement(
+            asset,
+            "mesh",
+            {
+                "name": object_mesh_name,
+                "file": mesh_path,
+                "scale": f"{mesh_scale[0]} {mesh_scale[1]} {mesh_scale[2]}",
+            },
+        )
+        geom_attrs.update({"type": "mesh", "mesh": object_mesh_name})
     else:
-        gtype = mj.mjtGeom.mjGEOM_SPHERE
-        draw_size = np.array([0.12, 0.0, 0.0])
-    
-    rgba = np.array([0.9, 0.2, 0.2, 1.0]) if contact else np.array([0.2, 0.9, 0.2, 0.5])
+        raise ValueError(f"Unsupported URDF visual geometry in: {object_path}")
 
-    # SciPy expects (x, y, z, w); user passes scalar-first (w, x, y, z)
-    mat = R.from_quat(quat_wxyz, scalar_first=True).as_matrix().reshape(-1)
-    return gtype, draw_size, pos, mat, rgba
+    ET.SubElement(body, "geom", geom_attrs)
 
-def draw_object(viewer, spec, data):
-    """Draw a single primitive at the desired pose in the on-screen viewer."""
-    params = _object_geom_params(spec, data)
-    if params is None:
-        return
-    gtype, size, pos, mat, rgba = params
-    geom = viewer.user_scn.geoms[viewer.user_scn.ngeom]
-    mj.mjv_initGeom(geom, type=gtype, size=size, pos=pos, mat=mat, rgba=rgba)
-    viewer.user_scn.ngeom += 1
+    robot_xml_abs = os.path.abspath(robot_xml_path)
+    robot_xml_dir = os.path.dirname(robot_xml_abs)
+    fd, tmp_xml_path = tempfile.mkstemp(
+        prefix="runtime_robot_with_object_",
+        suffix=".xml",
+        dir=robot_xml_dir if os.path.isdir(robot_xml_dir) else None,
+    )
+    os.close(fd)
+    robot_tree.write(tmp_xml_path, encoding="utf-8", xml_declaration=True)
+    return tmp_xml_path, object_body_name
 
 
 def draw_frame(
@@ -241,20 +248,44 @@ class RobotMotionViewer:
         
         self.robot_type = robot_type
         self.xml_path = ROBOT_XML_DICT[robot_type]
-        self.model = mj.MjModel.from_xml_path(str(self.xml_path))
+        self.object_mocap_id = None
+        self.runtime_model_xml_path = None
+        self.runtime_object_body_name = None
+
+        if object_model_path is None:
+            raise ValueError("object_model_path is required and must be a URDF.")
+
+        runtime_xml, runtime_body_name = _inject_urdf_object_into_robot_xml(
+            str(self.xml_path), object_model_path
+        )
+        _install_runtime_xml_cleanup_hooks()
+        _RUNTIME_XML_PATHS.add(runtime_xml)
+        self.model = mj.MjModel.from_xml_path(runtime_xml)
+        self.runtime_model_xml_path = runtime_xml
+        self.runtime_object_body_name = runtime_body_name
         self.data = mj.MjData(self.model)
         self.robot_base = ROBOT_BASE_DICT[robot_type]
         self.viewer_cam_distance = VIEWER_CAM_DISTANCE_DICT[robot_type]
         mj.mj_step(self.model, self.data)
+
+        body_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, self.runtime_object_body_name)
+        if body_id < 0:
+            raise RuntimeError(f"Runtime object body not found in model: {self.runtime_object_body_name}")
+        mocap_id = int(self.model.body_mocapid[body_id])
+        if mocap_id < 0:
+            raise RuntimeError(f"Runtime object body is not mocap: {self.runtime_object_body_name}")
+        self.object_mocap_id = mocap_id
+        geom_id = int(self.model.body_geomadr[body_id])
+        self.object_geom_id = geom_id if geom_id >= 0 else None
+        self.object_rgba_default = (
+            self.model.geom_rgba[self.object_geom_id].copy() if self.object_geom_id is not None else None
+        )
         
         self.motion_fps = motion_fps
         self.rate_limiter = RateLimiter(frequency=self.motion_fps, warn=False)
         self.camera_follow = camera_follow
         self.record_video = record_video
-        self.object_draw_spec = _load_object_draw_spec(object_model_path)
-        print(
-            f"[viewer] object draw spec: {self.object_draw_spec['name']} ({self.object_draw_spec['kind']})"
-        )
+        print(f"[viewer] runtime URDF object loaded in MuJoCo model: {self.runtime_object_body_name}")
 
 
         self.viewer = mjv.launch_passive(
@@ -308,6 +339,16 @@ class RobotMotionViewer:
         self.data.qpos[:3] = root_pos
         self.data.qpos[3:7] = root_rot # quat need to be scalar first! for mujoco
         self.data.qpos[7:] = dof_pos
+
+        if object_data is not None:
+            self.data.mocap_pos[self.object_mocap_id] = object_data[0]
+            self.data.mocap_quat[self.object_mocap_id] = object_data[1]
+            if self.object_geom_id is not None:
+                contact = bool(object_data[2])
+                if contact:
+                    self.model.geom_rgba[self.object_geom_id] = np.array([0.95, 0.2, 0.2, 1.0], dtype=float)
+                elif self.object_rgba_default is not None:
+                    self.model.geom_rgba[self.object_geom_id] = self.object_rgba_default
         
         mj.mj_forward(self.model, self.data)
         
@@ -317,17 +358,9 @@ class RobotMotionViewer:
             self.viewer.cam.elevation = -10  # 正面视角，轻微向下看
             # self.viewer.cam.azimuth = 180    # 正面朝向机器人
         
-        if human_motion_data is not None or object_data is not None:
+        if human_motion_data is not None:
             # Clean custom geometry
             self.viewer.user_scn.ngeom = 0
-        if object_data is not None:
-            draw_object(self.viewer, self.object_draw_spec, object_data)
-            draw_frame(
-                object_data[0],
-                R.from_quat(object_data[1], scalar_first=True).as_matrix(),
-                self.viewer,
-                0.8,
-            )
         # Draw the task targets for reference
         if human_motion_data is not None:
             for human_body_name, (pos, rot) in human_motion_data.items():
@@ -348,16 +381,6 @@ class RobotMotionViewer:
             # Use renderer for proper offscreen rendering
             self.renderer.update_scene(self.data, camera=self.viewer.cam)
 
-            # Also draw the kinematic object into the renderer's scene (so it shows in video)
-            if object_data is not None:
-                params = _object_geom_params(self.object_draw_spec, object_data)
-                if params is not None:
-                    gtype, size, pos, mat, rgba = params
-                    rscene = self.renderer.scene
-                    rgeom = rscene.geoms[rscene.ngeom]
-                    mj.mjv_initGeom(rgeom, type=gtype, size=size, pos=pos, mat=mat, rgba=rgba)
-                    rscene.ngeom += 1
-
             img = self.renderer.render()
             self.mp4_writer.append_data(img)
     
@@ -367,3 +390,9 @@ class RobotMotionViewer:
         if self.record_video:
             self.mp4_writer.close()
             print(f"Video saved to {self.video_path}")
+        if self.runtime_model_xml_path is not None:
+            try:
+                os.remove(self.runtime_model_xml_path)
+            except OSError:
+                pass
+            _RUNTIME_XML_PATHS.discard(self.runtime_model_xml_path)

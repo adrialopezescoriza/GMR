@@ -151,6 +151,8 @@ class PinocchioContactProjector:
         ground_contact_flags = (ground_contact_seq != 0)
         v_ref = finite_difference_velocities(obj_pos, dt)
         speed_ref = np.linalg.norm(v_ref, axis=1)
+        # Enforce hard ground constraints only when the object is effectively static.
+        ground_contact_hard_flags = ground_contact_flags & (speed_ref <= OBJECT_SPEED_THRESH)
         g_vec_dm = ca.DM(OBJECT_GRAVITY)
         zero3 = ca.DM.zeros(3, 1)
 
@@ -180,7 +182,13 @@ class PinocchioContactProjector:
         for t in range(N):
             q_t = q_traj[t, :].T
             q_base_pos = q_t[base_pos_idx: base_pos_idx + 3]
-            q_base_quat = q_t[base_quat_idx: base_quat_idx + 4]
+            q_base_quat_xyzw = q_t[base_quat_idx: base_quat_idx + 4]
+            q_base_quat = ca.vertcat(
+                q_base_quat_xyzw[3],
+                q_base_quat_xyzw[0],
+                q_base_quat_xyzw[1],
+                q_base_quat_xyzw[2],
+            )
             q_joints = q_t[7:]
             v_joints = v_traj[t, 6:].T
 
@@ -207,7 +215,13 @@ class PinocchioContactProjector:
                 v_joints_base = v_traj[t, 0:3].T
                 opti.subject_to(v_fd_base == v_joints_base)
 
-                q_prev_base_quat = q_traj[t - 1, base_quat_idx: base_quat_idx + 4].T
+                q_prev_base_quat_xyzw = q_traj[t - 1, base_quat_idx: base_quat_idx + 4].T
+                q_prev_base_quat = ca.vertcat(
+                    q_prev_base_quat_xyzw[3],
+                    q_prev_base_quat_xyzw[0],
+                    q_prev_base_quat_xyzw[1],
+                    q_prev_base_quat_xyzw[2],
+                )
                 q_conj = quat_conjugate_wxyz(q_prev_base_quat)
                 q_rel = quat_mul_wxyz(q_conj, q_base_quat)
                 axis_angle = axis_angle_from_quat_wxyz(q_rel)
@@ -274,7 +288,7 @@ class PinocchioContactProjector:
                     # Cost: keep ball at contact point during contact frames.
                     total_cost += OBJECT_CONTACT_WEIGHT * ca.sumsqr(p_object_t - p_WC_des)
 
-            if ground_contact_flags[t]:
+            if ground_contact_hard_flags[t]:
                 opti.subject_to(p_object_t[2] <= (obj_pos[t, 2] + 0.01))
                 opti.subject_to(p_object_t[2] >= (obj_pos[t, 2] - 0.01))
                 opti.subject_to(v_object_t[2] <= OBJECT_GROUND_VZ_ABS)
@@ -292,7 +306,10 @@ class PinocchioContactProjector:
             is_contact_k1 = body_contact_flags[k + 1] or ground_contact_flags[k + 1]
 
             if (not is_contact_k) and (not is_contact_k1):
-                opti.subject_to(v_next == v_k + dt * g_vec_dm)
+                # Free flight: penalize deviation from ballistic trajectory under gravity.
+                a_free = (v_next - v_k) / dt - g_vec_dm
+                total_cost += OBJECT_VEL_SMOOTH_W * ca.sumsqr(a_free)
+                # opti.subject_to(v_next == v_k + dt * g_vec_dm)
             else:
                 dv_z = v_next[2] - v_k[2]
                 # Cost: smooth vertical velocity while in contact.
@@ -300,7 +317,7 @@ class PinocchioContactProjector:
 
             dv_xy = v_next[0:2] - v_k[0:2]
             # Cost: smooth horizontal velocity changes.
-            total_cost += OBJECT_GROUND_SMOOTH_W * ca.sumsqr(dv_xy)
+            total_cost += OBJECT_VEL_SMOOTH_W * ca.sumsqr(dv_xy)
 
             if speed_ref[k] > OBJECT_SPEED_THRESH:
                 v_ref_k = ca.DM(v_ref[k])
@@ -323,12 +340,13 @@ class PinocchioContactProjector:
 
         opti.minimize(total_cost)
 
+        ## Initialize optimization with reference motion.
         q_init = np.zeros((N, nq))
         v_init = np.zeros((N, nv))
+        base_idx = self.robot.base_q_start
         for t in range(N):
             x, y, z = root_pos[t]
             w_ref, qx_ref, qy_ref, qz_ref = root_rot[t]
-            base_idx = self.robot.base_q_start
             q_init[t, base_idx:base_idx + 3] = np.array([x, y, z])
             q_init[t, base_idx + 3:base_idx + 7] = np.array([qx_ref, qy_ref, qz_ref, w_ref])
             for i, j_name in enumerate(dof_names):
@@ -340,12 +358,12 @@ class PinocchioContactProjector:
 
         for t in range(1, N):
             v_init[t, :3] = np.clip(
-                (q_init[t, :3] - q_init[t - 1, :3]) / dt,
+                (q_init[t, base_idx:base_idx + 3] - q_init[t - 1, base_idx:base_idx + 3]) / dt,
                 -self.robot.v_abs[:3],
                 self.robot.v_abs[:3],
             )
-            q_prev_quat = q_init[t - 1, 3:7]
-            q_curr_quat = q_init[t, 3:7]
+            q_prev_quat = q_init[t - 1, base_idx + 3:base_idx + 7][[3, 0, 1, 2]]
+            q_curr_quat = q_init[t, base_idx + 3:base_idx + 7][[3, 0, 1, 2]]
             q_conj = quat_conjugate_wxyz(ca.DM(q_prev_quat.reshape(4, 1)))
             q_rel = quat_mul_wxyz(q_conj, ca.DM(q_curr_quat.reshape(4, 1)))
             axis_angle = axis_angle_from_quat_wxyz(q_rel)
@@ -359,7 +377,8 @@ class PinocchioContactProjector:
                 -self.robot.v_abs[6:],
                 self.robot.v_abs[6:],
             )
-        v_init[0, :] = v_init[1, :]
+        if N > 1:
+            v_init[0, :] = v_init[1, :]
 
         opti.set_initial(q_traj, q_init)
         opti.set_initial(v_traj, v_init)

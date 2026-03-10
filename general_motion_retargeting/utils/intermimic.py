@@ -92,7 +92,7 @@ def load_intermimic_hoi_2d(input_path: str) -> np.ndarray:
     if hoi_data is None:
         raise ValueError(f"Could not find InterMimic `hoi_data` in {input_path}.")
 
-    hoi_np = _to_numpy(hoi_data).astype(np.float32)
+    hoi_np = _to_numpy(hoi_data).astype(np.float32)[1:]  # Skip the first frame which is often all zeros.
 
     if hoi_np.ndim == 3:
         lengths = payload.get("_motion_lengths") if isinstance(payload, dict) else None

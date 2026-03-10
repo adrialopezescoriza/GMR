@@ -5,22 +5,89 @@ from typing import Iterable, Optional
 
 DEFAULT_OBJECT_MODEL_PATH = "assets/objects/basketball.urdf"
 
+DEFAULT_ANCHOR_LINKS_SMPLX = ["left_index3", "right_index3"]
+DEFAULT_CONTACT_LINKS = ["left_hand_middle_0_link", "right_hand_middle_0_link"]
+
 OBJECT_MOTION_DEFAULTS = {
     "basketball": {
-        "min_object_height": 0.13,
-        "anchor_links_smplx": ["left_index3", "right_index3"],
-        "contact_links": [
-            "left_hand_middle_0_link",
-            "right_hand_middle_0_link",
-        ],
+        "min_object_height": 0.16,
+        "anchor_links_smplx": DEFAULT_ANCHOR_LINKS_SMPLX,
+        "contact_links": DEFAULT_CONTACT_LINKS,
+    },
+    "clothesstand": {
+        "min_object_height": 0.34,
+        "anchor_links_smplx": DEFAULT_ANCHOR_LINKS_SMPLX,
+        "contact_links": DEFAULT_CONTACT_LINKS,
+    },
+    "floorlamp": {
+        "min_object_height": 0.34,
+        "anchor_links_smplx": DEFAULT_ANCHOR_LINKS_SMPLX,
+        "contact_links": DEFAULT_CONTACT_LINKS,
     },
     "largebox": {
-        "min_object_height": 0.5,
-        "anchor_links_smplx": ["left_index3", "right_index3"],
-        "contact_links": [
-            "left_hand_middle_0_link",
-            "right_hand_middle_0_link",
-        ],
+        "min_object_height": 0.27,
+        "anchor_links_smplx": DEFAULT_ANCHOR_LINKS_SMPLX,
+        "contact_links": DEFAULT_CONTACT_LINKS,
+    },
+    "largetable": {
+        "min_object_height": 0.39,
+        "anchor_links_smplx": DEFAULT_ANCHOR_LINKS_SMPLX,
+        "contact_links": DEFAULT_CONTACT_LINKS,
+    },
+    "monitor": {
+        "min_object_height": 0.17,
+        "anchor_links_smplx": DEFAULT_ANCHOR_LINKS_SMPLX,
+        "contact_links": DEFAULT_CONTACT_LINKS,
+    },
+    "mop": {
+        "min_object_height": 0.51,
+        "anchor_links_smplx": DEFAULT_ANCHOR_LINKS_SMPLX,
+        "contact_links": DEFAULT_CONTACT_LINKS,
+    },
+    "plasticbox": {
+        "min_object_height": 0.27,
+        "anchor_links_smplx": DEFAULT_ANCHOR_LINKS_SMPLX,
+        "contact_links": DEFAULT_CONTACT_LINKS,
+    },
+    "smallbox": {
+        "min_object_height": 0.17,
+        "anchor_links_smplx": DEFAULT_ANCHOR_LINKS_SMPLX,
+        "contact_links": DEFAULT_CONTACT_LINKS,
+    },
+    "smalltable": {
+        "min_object_height": 0.222,
+        "anchor_links_smplx": DEFAULT_ANCHOR_LINKS_SMPLX,
+        "contact_links": DEFAULT_CONTACT_LINKS,
+    },
+    "suitcase": {
+        "min_object_height": 0.32,
+        "anchor_links_smplx": DEFAULT_ANCHOR_LINKS_SMPLX,
+        "contact_links": DEFAULT_CONTACT_LINKS,
+    },
+    "trashcan": {
+        "min_object_height": 0.205,
+        "anchor_links_smplx": DEFAULT_ANCHOR_LINKS_SMPLX,
+        "contact_links": DEFAULT_CONTACT_LINKS,
+    },
+    "tripod": {
+        "min_object_height": 0.29,
+        "anchor_links_smplx": DEFAULT_ANCHOR_LINKS_SMPLX,
+        "contact_links": DEFAULT_CONTACT_LINKS,
+    },
+    "vacuum": {
+        "min_object_height": 0.37,
+        "anchor_links_smplx": DEFAULT_ANCHOR_LINKS_SMPLX,
+        "contact_links": DEFAULT_CONTACT_LINKS,
+    },
+    "whitechair": {
+        "min_object_height": 0.60,
+        "anchor_links_smplx": DEFAULT_ANCHOR_LINKS_SMPLX,
+        "contact_links": DEFAULT_CONTACT_LINKS,
+    },
+    "woodchair": {
+        "min_object_height": 0.50,
+        "anchor_links_smplx": DEFAULT_ANCHOR_LINKS_SMPLX,
+        "contact_links": DEFAULT_CONTACT_LINKS,
     },
 }
 
@@ -104,7 +171,7 @@ def resolve_object_model_path(
 
 def get_object_motion_defaults(object_model_path: str) -> dict:
     model_name = os.path.splitext(os.path.basename(object_model_path))[0].lower()
-    cfg = OBJECT_MOTION_DEFAULTS.get(model_name, OBJECT_MOTION_DEFAULTS["basketball"])
+    cfg = OBJECT_MOTION_DEFAULTS[model_name]
     return {
         "min_object_height": float(cfg["min_object_height"]),
         "anchor_links_smplx": list(cfg["anchor_links_smplx"]),
