@@ -88,6 +88,7 @@ class PinocchioContactProjector:
         min_object_height,
         anchor_links_smplx=None,
         contact_links=None,
+        optimize_object=True,
     ):
         self.robot = PinocchioCasadiRobot(
             urdf_path,
@@ -99,6 +100,7 @@ class PinocchioContactProjector:
         self.min_object_height = float(min_object_height)
         self.anchor_links_smplx = anchor_links_smplx or []
         self.contact_links = contact_links or []
+        self.optimize_object = bool(optimize_object)
 
     def project_motion(self, motion_data: dict) -> dict:
         fps = float(motion_data["fps"])
@@ -172,8 +174,8 @@ class PinocchioContactProjector:
         opti = ca.Opti()
         q_traj = opti.variable(N, nq)
         v_traj = opti.variable(N, nv)
-        object_pos = opti.variable(N, 3)
-        object_vel = opti.variable(N, 3)
+        object_pos = opti.variable(N, 3) if self.optimize_object else None
+        object_vel = opti.variable(N, 3) if self.optimize_object else None
 
         total_cost = 0
         base_pos_idx = self.robot.base_q_start
@@ -275,68 +277,70 @@ class PinocchioContactProjector:
                         R_BB - ca.DM(R_local_ref[t, idx])
                     )
 
-            p_object_t = object_pos[t, :].T
-            v_object_t = object_vel[t, :].T
+            if self.optimize_object:
+                p_object_t = object_pos[t, :].T
+                v_object_t = object_vel[t, :].T
 
-            if body_contact_flags[t]:
-                for name, p_BC_DM in contact_offsets_dm.items():
-                    if name not in self.robot.fk_world_pos:
-                        continue
-                    p_WB = self.robot.world_pos(name, q_t)
-                    R_WB = self.robot.world_rotmat(name, q_t)
-                    p_WC_des = p_WB + R_WB @ p_BC_DM[t, :].T
-                    # Cost: keep ball at contact point during contact frames.
-                    total_cost += OBJECT_CONTACT_WEIGHT * ca.sumsqr(p_object_t - p_WC_des)
+                if body_contact_flags[t]:
+                    for name, p_BC_DM in contact_offsets_dm.items():
+                        if name not in self.robot.fk_world_pos:
+                            continue
+                        p_WB = self.robot.world_pos(name, q_t)
+                        R_WB = self.robot.world_rotmat(name, q_t)
+                        p_WC_des = p_WB + R_WB @ p_BC_DM[t, :].T
+                        # Cost: keep ball at contact point during contact frames.
+                        total_cost += OBJECT_CONTACT_WEIGHT * ca.sumsqr(p_object_t - p_WC_des)
 
-            if ground_contact_hard_flags[t]:
-                opti.subject_to(p_object_t[2] <= (obj_pos[t, 2] + 0.01))
-                opti.subject_to(p_object_t[2] >= (obj_pos[t, 2] - 0.01))
-                opti.subject_to(v_object_t[2] <= OBJECT_GROUND_VZ_ABS)
-                opti.subject_to(v_object_t[2] >= -OBJECT_GROUND_VZ_ABS)
+                if ground_contact_hard_flags[t]:
+                    opti.subject_to(p_object_t[2] <= (obj_pos[t, 2] + 0.01))
+                    opti.subject_to(p_object_t[2] >= (obj_pos[t, 2] - 0.01))
+                    opti.subject_to(v_object_t[2] <= OBJECT_GROUND_VZ_ABS)
+                    opti.subject_to(v_object_t[2] >= -OBJECT_GROUND_VZ_ABS)
 
-        for k in range(N - 1):
-            p_k = object_pos[k, :].T
-            v_k = object_vel[k, :].T
-            p_next = object_pos[k + 1, :].T
-            v_next = object_vel[k + 1, :].T
+        if self.optimize_object:
+            for k in range(N - 1):
+                p_k = object_pos[k, :].T
+                v_k = object_vel[k, :].T
+                p_next = object_pos[k + 1, :].T
+                v_next = object_vel[k + 1, :].T
 
-            opti.subject_to(p_next == p_k + dt * v_k)
+                opti.subject_to(p_next == p_k + dt * v_k)
 
-            is_contact_k = body_contact_flags[k] or ground_contact_flags[k]
-            is_contact_k1 = body_contact_flags[k + 1] or ground_contact_flags[k + 1]
+                is_contact_k = body_contact_flags[k] or ground_contact_flags[k]
+                is_contact_k1 = body_contact_flags[k + 1] or ground_contact_flags[k + 1]
 
-            if (not is_contact_k) and (not is_contact_k1):
-                # Free flight: penalize deviation from ballistic trajectory under gravity.
-                a_free = (v_next - v_k) / dt - g_vec_dm
-                total_cost += OBJECT_VEL_SMOOTH_W * ca.sumsqr(a_free)
-                # opti.subject_to(v_next == v_k + dt * g_vec_dm)
+                if (not is_contact_k) and (not is_contact_k1):
+                    # Free flight: penalize deviation from ballistic trajectory under gravity.
+                    a_free = (v_next - v_k) / dt - g_vec_dm
+                    total_cost += OBJECT_VEL_SMOOTH_W * ca.sumsqr(a_free)
+                    # opti.subject_to(v_next == v_k + dt * g_vec_dm)
+                else:
+                    dv_z = v_next[2] - v_k[2]
+                    # Cost: smooth vertical velocity while in contact.
+                    total_cost += OBJECT_VEL_SMOOTH_W * ca.sumsqr(dv_z)
+
+                dv_xy = v_next[0:2] - v_k[0:2]
+                # Cost: smooth horizontal velocity changes.
+                total_cost += OBJECT_VEL_SMOOTH_W * ca.sumsqr(dv_xy)
+
+                if speed_ref[k] > OBJECT_SPEED_THRESH:
+                    v_ref_k = ca.DM(v_ref[k])
+                    denom = (ca.norm_2(v_k) * ca.norm_2(v_ref_k) + 1e-8)
+                    cos_sim = (v_k.T @ v_ref_k) / denom
+                    # Cost: align ball velocity direction with reference when moving.
+                    total_cost += (1.0 - cos_sim)
+                else:
+                    opti.subject_to(v_k == zero3)
+
+            v_last = object_vel[N - 1, :].T
+            if speed_ref[N - 1] > OBJECT_SPEED_THRESH:
+                v_ref_last = ca.DM(v_ref[N - 1])
+                denom_last = (ca.norm_2(v_last) * ca.norm_2(v_ref_last) + 1e-8)
+                cos_sim_last = (v_last.T @ v_ref_last) / denom_last
+                # Cost: align final ball velocity direction with reference when moving.
+                total_cost += (1.0 - cos_sim_last)
             else:
-                dv_z = v_next[2] - v_k[2]
-                # Cost: smooth vertical velocity while in contact.
-                total_cost += OBJECT_VEL_SMOOTH_W * ca.sumsqr(dv_z)
-
-            dv_xy = v_next[0:2] - v_k[0:2]
-            # Cost: smooth horizontal velocity changes.
-            total_cost += OBJECT_VEL_SMOOTH_W * ca.sumsqr(dv_xy)
-
-            if speed_ref[k] > OBJECT_SPEED_THRESH:
-                v_ref_k = ca.DM(v_ref[k])
-                denom = (ca.norm_2(v_k) * ca.norm_2(v_ref_k) + 1e-8)
-                cos_sim = (v_k.T @ v_ref_k) / denom
-                # Cost: align ball velocity direction with reference when moving.
-                total_cost += (1.0 - cos_sim)
-            else:
-                opti.subject_to(v_k == zero3)
-
-        v_last = object_vel[N - 1, :].T
-        if speed_ref[N - 1] > OBJECT_SPEED_THRESH:
-            v_ref_last = ca.DM(v_ref[N - 1])
-            denom_last = (ca.norm_2(v_last) * ca.norm_2(v_ref_last) + 1e-8)
-            cos_sim_last = (v_last.T @ v_ref_last) / denom_last
-            # Cost: align final ball velocity direction with reference when moving.
-            total_cost += (1.0 - cos_sim_last)
-        else:
-            opti.subject_to(v_last == zero3)
+                opti.subject_to(v_last == zero3)
 
         opti.minimize(total_cost)
 
@@ -388,8 +392,9 @@ class PinocchioContactProjector:
         else:
             object_vel_init = v_ref
 
-        opti.set_initial(object_pos, obj_pos)
-        opti.set_initial(object_vel, object_vel_init)
+        if self.optimize_object:
+            opti.set_initial(object_pos, obj_pos)
+            opti.set_initial(object_vel, object_vel_init)
 
         opti.solver("ipopt", {"ipopt.print_level": 0, "print_time": False})
 
@@ -404,8 +409,12 @@ class PinocchioContactProjector:
         print(f"[INFO] Solver time: {time.time() - t0:.2f} s")
 
         q_sol = sol.value(q_traj)
-        object_pos_sol = sol.value(object_pos)
-        object_vel_sol = sol.value(object_vel)
+        if self.optimize_object:
+            object_pos_sol = sol.value(object_pos)
+            object_vel_sol = sol.value(object_vel)
+        else:
+            object_pos_sol = obj_pos
+            object_vel_sol = object_vel_init
 
         new_dof_pos = np.zeros_like(dof_pos)
         new_world_body_pos = np.zeros_like(ref_world_body_pos)
@@ -614,6 +623,7 @@ def process_folder(
     record_video: bool,
     urdf_path: str,
     default_object_model_path: str,
+    optimize_object: bool,
 ):
     for root, _, files in os.walk(src_folder):
         rel_root = os.path.relpath(root, src_folder)
@@ -641,6 +651,7 @@ def process_folder(
                     min_object_height=object_defaults["min_object_height"],
                     anchor_links_smplx=object_defaults["anchor_links_smplx"],
                     contact_links=object_defaults["contact_links"],
+                    optimize_object=optimize_object,
                 )
             projector = projector_cache[object_model_path]
 
@@ -686,6 +697,12 @@ if __name__ == "__main__":
         default=OBJECT_MODEL_PATH,
         help="Optional external object visual model (.urdf/.xml/.obj/.stl/.dae).",
     )
+    parser.add_argument(
+        "--optimize_object",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include object position/velocity variables and object-specific constraints in the NLP.",
+    )
     args = parser.parse_args()
 
     projector_cache = {}
@@ -702,6 +719,7 @@ if __name__ == "__main__":
             record_video=args.record_video,
             urdf_path=args.urdf_path,
             default_object_model_path=args.object_model_path,
+            optimize_object=args.optimize_object,
         )
     elif args.input_file:
         object_model_path = resolve_object_model_path(
@@ -719,6 +737,7 @@ if __name__ == "__main__":
                 min_object_height=object_defaults["min_object_height"],
                 anchor_links_smplx=object_defaults["anchor_links_smplx"],
                 contact_links=object_defaults["contact_links"],
+                optimize_object=args.optimize_object,
             )
         projector = projector_cache[object_model_path]
 
