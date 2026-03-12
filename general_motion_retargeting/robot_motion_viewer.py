@@ -231,6 +231,20 @@ def draw_frame(
         )
         v.user_scn.ngeom += 1
 
+
+def draw_sphere(pos, v, radius=0.025, rgba=(1.0, 0.65, 0.0, 1.0)):
+    geom = v.user_scn.geoms[v.user_scn.ngeom]
+    mj.mjv_initGeom(
+        geom,
+        type=mj.mjtGeom.mjGEOM_SPHERE,
+        size=[radius, radius, radius],
+        pos=np.asarray(pos, dtype=float),
+        mat=np.eye(3).flatten(),
+        rgba=np.asarray(rgba, dtype=float),
+    )
+    v.user_scn.ngeom += 1
+
+
 class RobotMotionViewer:
     def __init__(self,
                 robot_type,
@@ -322,6 +336,7 @@ class RobotMotionViewer:
             # human pos offset add for visualization    
             human_pos_offset=np.array([0.0, 0.0, 0]),
             object_data=None,
+            object_contact_points_world=None,
             # rate limit
             rate_limit=True, 
             follow_camera=True,
@@ -358,7 +373,7 @@ class RobotMotionViewer:
             self.viewer.cam.elevation = -10  # 正面视角，轻微向下看
             # self.viewer.cam.azimuth = 180    # 正面朝向机器人
         
-        if human_motion_data is not None:
+        if human_motion_data is not None or object_contact_points_world is not None:
             # Clean custom geometry
             self.viewer.user_scn.ngeom = 0
         # Draw the task targets for reference
@@ -371,6 +386,16 @@ class RobotMotionViewer:
                     human_point_scale,
                     pos_offset=human_pos_offset,
                     joint_name=human_body_name if show_human_body_name else None
+                )
+        if object_contact_points_world is not None:
+            if isinstance(object_contact_points_world, dict):
+                contact_points_iter = object_contact_points_world.values()
+            else:
+                contact_points_iter = object_contact_points_world
+            for contact_pos in contact_points_iter:
+                draw_sphere(
+                    pos=np.asarray(contact_pos, dtype=float),
+                    v=self.viewer,
                 )
 
         self.viewer.sync()

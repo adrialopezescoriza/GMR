@@ -5,8 +5,8 @@ from typing import Iterable, Optional
 
 DEFAULT_OBJECT_MODEL_PATH = "assets/objects/basketball.urdf"
 
-DEFAULT_ANCHOR_LINKS_SMPLX = ["left_index3", "right_index3"]
-DEFAULT_CONTACT_LINKS = ["left_hand_middle_0_link", "right_hand_middle_0_link"]
+DEFAULT_ANCHOR_LINKS_SMPLX = ["left_index3", "right_index3"] # ["left_wrist", "right_wrist"], ["left_index3", "right_index3"]
+DEFAULT_CONTACT_LINKS = ["left_hand_middle_0_link", "right_hand_middle_0_link"] # ["left_wrist_yaw_link", "right_wrist_yaw_link"], ["left_hand_middle_0_link", "right_hand_middle_0_link"]
 
 OBJECT_MOTION_DEFAULTS = {
     "basketball": {
@@ -25,12 +25,12 @@ OBJECT_MOTION_DEFAULTS = {
         "contact_links": DEFAULT_CONTACT_LINKS,
     },
     "largebox": {
-        "min_object_height": 0.27,
+        "min_object_height": 0.30,
         "anchor_links_smplx": DEFAULT_ANCHOR_LINKS_SMPLX,
         "contact_links": DEFAULT_CONTACT_LINKS,
     },
     "largetable": {
-        "min_object_height": 0.39,
+        "min_object_height": 0.43,
         "anchor_links_smplx": DEFAULT_ANCHOR_LINKS_SMPLX,
         "contact_links": DEFAULT_CONTACT_LINKS,
     },

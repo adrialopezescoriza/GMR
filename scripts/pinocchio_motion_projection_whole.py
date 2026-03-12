@@ -33,6 +33,38 @@ from general_motion_retargeting.rot_utils import (
     pad_or_truncate_1d,
 )
 
+def _compute_object_contact_points_world_by_frame(
+    motion_data: dict,
+    num_frames: int,
+) -> list[dict[str, np.ndarray]]:
+    contact_link_names = list(motion_data.get("contact_link_names", []))
+    fixed_contact_points_object = motion_data.get("fixed_contact_points_in_object_frame")
+    if fixed_contact_points_object is None or not contact_link_names:
+        return []
+
+    contact_points_object = np.asarray(fixed_contact_points_object, dtype=np.float32)
+    if contact_points_object.size == 0:
+        return []
+    contact_points_object = contact_points_object.reshape(-1, 3)
+    if contact_points_object.shape[0] != len(contact_link_names):
+        return []
+
+    if "object_pos" not in motion_data or "object_rot" not in motion_data:
+        return []
+    object_pos = pad_or_truncate(np.asarray(motion_data["object_pos"], dtype=np.float32), num_frames)
+    object_rot = pad_or_truncate(np.asarray(motion_data["object_rot"], dtype=np.float32), num_frames)
+
+    contact_points_world_by_frame = []
+    for t in range(num_frames):
+        R_world_object = rot_from_quat_wxyz(object_rot[t])
+        frame_contact_points = {}
+        for c, link_name in enumerate(contact_link_names):
+            frame_contact_points[link_name] = (
+                object_pos[t] + R_world_object @ contact_points_object[c]
+            )
+        contact_points_world_by_frame.append(frame_contact_points)
+    return contact_points_world_by_frame
+
 
 URDF_PATH = "assets/unitree_g1/g1_29dof_w_hands.urdf"
 OBJECT_MODEL_PATH = "assets/objects/basketball.urdf"
@@ -158,18 +190,20 @@ class PinocchioContactProjector:
         g_vec_dm = ca.DM(OBJECT_GRAVITY)
         zero3 = ca.DM.zeros(3, 1)
 
-        contact_offsets = {}
-        for link_name in self.contact_links:
-            if "left" in link_name and "object_pos_in_left_hand_frame" in motion_data:
-                contact_offsets[link_name] = -np.asarray(motion_data["object_pos_in_left_hand_frame"])
-            elif "right" in link_name and "object_pos_in_right_hand_frame" in motion_data:
-                contact_offsets[link_name] = -np.asarray(motion_data["object_pos_in_right_hand_frame"])
-            else:
-                contact_offsets[link_name] = np.zeros((N, 3), dtype=np.float32)
-        contact_offsets_dm = {
-            name: ca.DM(offset)
-            for name, offset in contact_offsets.items()
-        }
+        contact_points_object_dm = {}
+        contact_link_names = list(motion_data.get("contact_link_names", []))
+        fixed_contact_points_object = np.asarray(
+            motion_data.get("fixed_contact_points_in_object_frame", []),
+            dtype=np.float32,
+        )
+        if fixed_contact_points_object.size > 0:
+            fixed_contact_points_object = fixed_contact_points_object.reshape(-1, 3)
+            if fixed_contact_points_object.shape[0] == len(contact_link_names):
+                contact_points_object_dm = {
+                    name: ca.DM(fixed_contact_points_object[i].reshape(3, 1))
+                    for i, name in enumerate(contact_link_names)
+                }
+        R_world_object_dm = [ca.DM(rot_from_quat_wxyz(obj_rot[t])) for t in range(N)]
 
         opti = ca.Opti()
         q_traj = opti.variable(N, nq)
@@ -280,22 +314,23 @@ class PinocchioContactProjector:
             if self.optimize_object:
                 p_object_t = object_pos[t, :].T
                 v_object_t = object_vel[t, :].T
-
-                if body_contact_flags[t]:
-                    for name, p_BC_DM in contact_offsets_dm.items():
-                        if name not in self.robot.fk_world_pos:
-                            continue
-                        p_WB = self.robot.world_pos(name, q_t)
-                        R_WB = self.robot.world_rotmat(name, q_t)
-                        p_WC_des = p_WB + R_WB @ p_BC_DM[t, :].T
-                        # Cost: keep ball at contact point during contact frames.
-                        total_cost += OBJECT_CONTACT_WEIGHT * ca.sumsqr(p_object_t - p_WC_des)
-
+                
                 if ground_contact_hard_flags[t]:
                     opti.subject_to(p_object_t[2] <= (obj_pos[t, 2] + 0.01))
                     opti.subject_to(p_object_t[2] >= (obj_pos[t, 2] - 0.01))
                     opti.subject_to(v_object_t[2] <= OBJECT_GROUND_VZ_ABS)
                     opti.subject_to(v_object_t[2] >= -OBJECT_GROUND_VZ_ABS)
+            else:
+                p_object_t = ca.DM(obj_pos[t, :].reshape(3, 1))
+                v_object_t = ca.DM(v_ref[t, :].reshape(3, 1))
+
+            if body_contact_flags[t]:
+                for name, p_OC_DM in contact_points_object_dm.items():
+                    if name not in self.robot.fk_world_pos:
+                        continue
+                    p_WB = self.robot.world_pos(name, q_t)  # contact-link world position
+                    p_WC_from_object = p_object_t + R_world_object_dm[t] @ p_OC_DM  # contact point world position from object
+                    total_cost += OBJECT_CONTACT_WEIGHT * ca.sumsqr(p_WC_from_object - p_WB)
 
         if self.optimize_object:
             for k in range(N - 1):
@@ -528,6 +563,10 @@ def record_motion_video(
     obj_pos = np.asarray(motion_data.get("object_pos")) if "object_pos" in motion_data else None
     obj_rot = np.asarray(motion_data.get("object_rot")) if "object_rot" in motion_data else None
     contact_seq = np.asarray(motion_data.get("contact_sequence")).reshape(-1) if "contact_sequence" in motion_data else None
+    contact_points_world_by_frame = _compute_object_contact_points_world_by_frame(
+        motion_data=motion_data,
+        num_frames=root_pos.shape[0],
+    )
 
     viewer = RobotMotionViewer(
         robot_type=robot,
@@ -538,16 +577,17 @@ def record_motion_video(
     )
     try:
         for t in range(root_pos.shape[0]):
+            contact = float(contact_seq[t]) if (contact_seq is not None and t < contact_seq.shape[0]) else 0.0
             object_data = None
             if obj_pos is not None and obj_rot is not None:
-                contact = 0.0
-                if contact_seq is not None and t < contact_seq.shape[0]:
-                    contact = float(contact_seq[t])
                 object_data = (obj_pos[t], obj_rot[t], contact)
             human_motion_data = {
                 name: (world_body_pos[t, i], world_body_orient[t, i])
                 for i, name in enumerate(body_names)
             }
+            object_contact_points_world = None
+            if t < len(contact_points_world_by_frame):
+                object_contact_points_world = contact_points_world_by_frame[t]
             viewer.step(
                 root_pos=root_pos[t],
                 root_rot=root_rot[t],
@@ -556,6 +596,7 @@ def record_motion_video(
                 show_human_body_name=True,
                 human_pos_offset=np.array([0.0, 0.0, 0.0]),
                 object_data=object_data,
+                object_contact_points_world=object_contact_points_world,
                 rate_limit=True,
             )
     finally:

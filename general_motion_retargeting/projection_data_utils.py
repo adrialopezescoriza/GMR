@@ -162,7 +162,7 @@ def _build_motion_data_from_source_frames(
     object_pos = pad_or_truncate(np.asarray(object_pos, dtype=np.float32), T)
     object_rot_wxyz = pad_or_truncate(np.asarray(object_rot_wxyz, dtype=np.float32), T)
     object_contact = pad_or_truncate(np.asarray(object_contact, dtype=np.float32).reshape(-1, 1), T)
-    m = (object_contact > 0.5).astype(np.float32)
+    contact_mask = object_contact.reshape(-1) > 0.5
     anchor_links_smplx = list(anchor_links_smplx)
     if len(anchor_links_smplx) == 2:
         left_anchor_link, right_anchor_link = anchor_links_smplx[0], anchor_links_smplx[1]
@@ -175,8 +175,9 @@ def _build_motion_data_from_source_frames(
     object_pos_in_left_hand_frame = R.from_quat(left_hand_rot_wxyz[:, [1, 2, 3, 0]]).inv().apply(object_pos - left_hand_pos_world)[:, [1, 0, 2]]
     object_pos_in_right_hand_frame = R.from_quat(right_hand_rot_wxyz[:, [1, 2, 3, 0]]).inv().apply(object_pos - right_hand_pos_world)[:, [1, 0, 2]]
 
-    object_pos_in_left_hand_frame[m[:, 0] > 0.5] = object_pos_in_left_hand_frame[m[:, 0] > 0.5].mean(axis=0)
-    object_pos_in_right_hand_frame[m[:, 0] > 0.5] = object_pos_in_right_hand_frame[m[:, 0] > 0.5].mean(axis=0)
+    if np.any(contact_mask):
+        object_pos_in_left_hand_frame[contact_mask] = object_pos_in_left_hand_frame[contact_mask].mean(axis=0)
+        object_pos_in_right_hand_frame[contact_mask] = object_pos_in_right_hand_frame[contact_mask].mean(axis=0)
 
     retarget = GeneralMotionRetargeting(
         actual_human_height=actual_human_height,
@@ -254,6 +255,37 @@ def _build_motion_data_from_source_frames(
     contact_link_names = list(contact_links)
     if not contact_link_names:
         return motion_data
+
+    left_contact_world = pad_or_truncate(
+        np.asarray(left_hand_pos_world, dtype=np.float32), num_frames
+    )
+    right_contact_world = pad_or_truncate(
+        np.asarray(right_hand_pos_world, dtype=np.float32), num_frames
+    )
+    object_rot_inv = R.from_quat(object_rot_wxyz[:, [1, 2, 3, 0]]).inv()
+
+    fixed_contact_points_object = []
+    for link_name in contact_link_names:
+        if "left" in link_name:
+            contact_world = left_contact_world
+        elif "right" in link_name:
+            contact_world = right_contact_world
+        else:
+            contact_world = object_pos
+
+        per_frame_points_object = object_rot_inv.apply(contact_world - object_pos)
+        if per_frame_points_object.shape[0] == 0:
+            fixed_point_object = np.zeros(3, dtype=np.float32)
+        elif np.any(contact_mask):
+            fixed_point_object = per_frame_points_object[contact_mask].mean(axis=0)
+        else:
+            fixed_point_object = per_frame_points_object.mean(axis=0)
+        fixed_contact_points_object.append(np.asarray(fixed_point_object, dtype=np.float32))
+
+    motion_data["contact_link_names"] = contact_link_names
+    motion_data["fixed_contact_points_in_object_frame"] = np.asarray(
+        fixed_contact_points_object, dtype=np.float32
+    )
 
     try:
         optimized_object_pos, optimized_object_vel = optimize_object_traj_from_motion(

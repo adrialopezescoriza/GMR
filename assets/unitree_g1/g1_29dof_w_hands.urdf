@@ -1,4 +1,4 @@
-<robot name="g1_23dof_lock_wrist">
+<robot name="g1_29dof_w_hands">
   <material name="dark">
     <color rgba="0.2 0.2 0.2 1"/>
   </material>
@@ -7,7 +7,7 @@
   </material>
 
   <mujoco>
-    <compiler meshdir="meshes" discardvisual="false"/>
+    <compiler meshdir="meshes_obj" discardvisual="false"/>
   </mujoco>
 
   <!-- [CAUTION] uncomment when convert to mujoco -->
@@ -735,7 +735,7 @@
     <child link="left_rubber_hand"/>
   </joint>
   <joint name="left_hand_middle_0_joint" type="fixed" dont_collapse="true">
-    <origin xyz="0.1192 0.0046 -0.0285" rpy="0 0 0"/>
+    <origin xyz="0.1192 -0.0186 0.0285" rpy="0 0 0"/>
     <parent link="left_wrist_yaw_link"/>
     <child link="left_hand_middle_0_link"/>
   </joint>
@@ -955,7 +955,7 @@
     <child link="right_rubber_hand"/>
   </joint>
   <joint name="right_hand_middle_0_joint" type="fixed" dont_collapse="true">
-    <origin xyz="0.1192 -0.0046 -0.0285" rpy="0 0 0"/>
+    <origin xyz="0.1192 0.0186 0.0285" rpy="0 0 0"/>
     <parent link="right_wrist_yaw_link"/>
     <child link="right_hand_middle_0_link"/>
   </joint>
