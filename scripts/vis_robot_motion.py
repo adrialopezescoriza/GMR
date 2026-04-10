@@ -3,6 +3,8 @@ import argparse
 import os
 from tqdm import tqdm
 
+OBJECT_MODEL_PATH = "assets/objects/basketball.urdf"
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--robot", type=str, default="unitree_g1")
@@ -12,7 +14,12 @@ if __name__ == "__main__":
     parser.add_argument("--record_video", action="store_true")
     parser.add_argument("--video_path", type=str, 
                         default="videos/example.mp4")
-                        
+    parser.add_argument(
+        "--object_model_path",
+        type=str,
+        default=OBJECT_MODEL_PATH,
+        help="Optional external object visual model (.urdf/.xml/.obj/.stl/.dae).",
+    )         
     args = parser.parse_args()
     
     robot_type = args.robot
@@ -26,7 +33,10 @@ if __name__ == "__main__":
     env = RobotMotionViewer(robot_type=robot_type,
                             motion_fps=motion_fps,
                             camera_follow=False,
-                            record_video=args.record_video, video_path=args.video_path)
+                            record_video=args.record_video,
+                            video_path=args.video_path,
+                            object_model_path=args.object_model_path,
+                            )
     
     frame_idx = 0
     while True:

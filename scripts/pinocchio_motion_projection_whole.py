@@ -135,6 +135,11 @@ class PinocchioContactProjector:
         self.optimize_object = bool(optimize_object)
 
     def project_motion(self, motion_data: dict) -> dict:
+        # Stage 2: build and solve one global trajectory optimization over the
+        # whole sequence. The GMR output in `motion_data` is used as the
+        # reference/initial guess, and this step adjusts the robot trajectory
+        # (and optionally the object trajectory) to reduce artifacts while
+        # staying close to the retargeted motion.
         fps = float(motion_data["fps"])
         dt = 1.0 / fps
 
@@ -205,6 +210,10 @@ class PinocchioContactProjector:
                 }
         R_world_object_dm = [ca.DM(rot_from_quat_wxyz(obj_rot[t])) for t in range(N)]
 
+        # Main optimization variables:
+        # - q_traj: robot configuration at every frame
+        # - v_traj: robot velocity at every frame
+        # - object_pos/object_vel: optional object trajectory variables
         opti = ca.Opti()
         q_traj = opti.variable(N, nq)
         v_traj = opti.variable(N, nv)
@@ -215,6 +224,12 @@ class PinocchioContactProjector:
         base_pos_idx = self.robot.base_q_start
         base_quat_idx = self.robot.base_q_start + 3
 
+        # Per-frame objective/constraint assembly:
+        # - enforce joint/velocity limits
+        # - keep velocities consistent with finite differences of q
+        # - track selected link poses from the GMR reference
+        # - penalize robot/object contact mismatch
+        # - optionally constrain the object during static ground contact
         for t in range(N):
             q_t = q_traj[t, :].T
             q_base_pos = q_t[base_pos_idx: base_pos_idx + 3]
@@ -332,6 +347,11 @@ class PinocchioContactProjector:
                     p_WC_from_object = p_object_t + R_world_object_dm[t] @ p_OC_DM  # contact point world position from object
                     total_cost += OBJECT_CONTACT_WEIGHT * ca.sumsqr(p_WC_from_object - p_WB)
 
+        # Sequence-level object dynamics terms:
+        # - enforce position integration p_{k+1} = p_k + dt * v_k
+        # - encourage ballistic motion in free flight
+        # - smooth velocities during contact
+        # - keep velocity direction aligned with the reference when moving
         if self.optimize_object:
             for k in range(N - 1):
                 p_k = object_pos[k, :].T
@@ -379,6 +399,8 @@ class PinocchioContactProjector:
 
         opti.minimize(total_cost)
 
+        # Stage 3: initialize the solver from the GMR reference motion so IPOPT
+        # starts from a sensible trajectory instead of from scratch.
         ## Initialize optimization with reference motion.
         q_init = np.zeros((N, nq))
         v_init = np.zeros((N, nv))
@@ -433,7 +455,8 @@ class PinocchioContactProjector:
 
         opti.solver("ipopt", {"ipopt.print_level": 0, "print_time": False})
 
-        print(f"[INFO] Solving global optimization (Vars: {N * (nq + nv)})...")
+        # Stage 4: solve the nonlinear program once for the full trajectory.
+        print(f"[INFO] Solving gradient-based optimization (Vars: {N * (nq + nv)})...")
         t0 = time.time()
         try:
             sol = opti.solve()
@@ -443,6 +466,8 @@ class PinocchioContactProjector:
             return motion_data
         print(f"[INFO] Solver time: {time.time() - t0:.2f} s")
 
+        # Stage 5: unpack the optimized decision variables and convert the
+        # optimized robot state back into the saved motion-data representation.
         q_sol = sol.value(q_traj)
         if self.optimize_object:
             object_pos_sol = sol.value(object_pos)
@@ -501,6 +526,7 @@ class PinocchioContactProjector:
                     [quat_BB.w, quat_BB.x, quat_BB.y, quat_BB.z]
                 )
 
+        # Stage 6: visualize the optimized result in Meshcat for inspection.
         # --------- Visualization of the optimized trajectory ----------
         print("[INFO] Visualizing optimized trajectory in Meshcat...")
         for t in range(N):
@@ -614,6 +640,10 @@ def process_file(
     record_video: bool,
     object_model_path: Optional[str] = None,
 ):
+    # Stage 1: build the initial projection data with GMR.
+    # This loads the source motion, retargets it frame-by-frame to the robot,
+    # computes FK reference poses, and may also run an object-only optimization
+    # to clean up the object trajectory before the global projection stage.
     with open(os.devnull, "w") as _null, contextlib.redirect_stdout(_null), contextlib.redirect_stderr(_null):
         motion_data, source_tag = build_projection_motion_data_with_gmr(
             input_path=in_path,
@@ -627,16 +657,22 @@ def process_file(
             object_speed_thresh=OBJECT_SPEED_THRESH,
         )
     print(f"[INFO] Loaded motion source '{source_tag}' from '{in_path}'.")
+
+    # Stage 2: run the whole-body Pinocchio/CasADi projection that refines the
+    # retargeted motion and optionally co-optimizes the object trajectory.
     fixed_motion = projector.project_motion(motion_data)
     # fixed_motion = motion_data
     if object_model_path is not None:
         fixed_motion = dict(fixed_motion)
         fixed_motion["object_model_path"] = object_model_path
+
+    # Stage 3: save the optimized motion for later playback / training / export.
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "wb") as f:
         pickle.dump(fixed_motion, f)
     print(f"[INFO] Saved projected motion data to: {out_path}")
     if record_video:
+        # Stage 4: optionally render a video of the final optimized trajectory.
         out_stem = str(pathlib.Path(out_path).with_suffix(""))
         if "/" in out_stem:
             motion_folder = out_stem.split("/", 1)[1]
@@ -695,7 +731,9 @@ def process_folder(
                     optimize_object=optimize_object,
                 )
             projector = projector_cache[object_model_path]
-
+            print(f"projector: {projector}")
+            print(f"in_path: {in_path}")
+            print(f"out_path: {out_path}")
             process_file(
                 projector=projector,
                 in_path=in_path,
@@ -714,7 +752,7 @@ if __name__ == "__main__":
         description="Retarget SMPL motion data with GMR and run joint robot+object optimization."
     )
     parser.add_argument("--src_folder", type=str, default="data/skillmimic/run", help="Source directory of SMPL motion files")
-    parser.add_argument("--tgt_folder", type=str, default="data/g1_skillmimic/run/projected_with_object", help="Target directory for projected .pkl files")
+    parser.add_argument("--tgt_folder", type=str, default="data/skillmimic/run/projected_with_object", help="Target directory for projected .pkl files")
     parser.add_argument("--input_file", type=str, help="Single input SMPL motion file")
     parser.add_argument("--save_path", type=str, help="Single output .pkl file")
     parser.add_argument("--tgt_fps", type=int, default=60, help="Target FPS for retargeting")
